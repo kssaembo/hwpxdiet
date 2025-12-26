@@ -4,41 +4,60 @@ import { PDFDocument, PDFName, PDFRawStream, PDFDict, PDFRef } from 'pdf-lib';
 import { OptimizationResult } from '../types';
 
 /**
- * Compresses an image blob using Canvas API
+ * Compresses an image blob using Canvas API while preserving transparency for PNG/GIF
  */
 async function compressImage(blob: Blob, quality: number): Promise<Blob> {
+  const originalType = blob.type;
+  const isTransparentFormat = originalType.includes('png') || originalType.includes('gif');
+  
+  const targetMime = isTransparentFormat ? 'image/webp' : 'image/jpeg';
+  
+  const objectUrl = URL.createObjectURL(blob);
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement('canvas');
       const ctx = canvas.getContext('2d');
-      if (!ctx) return reject(new Error('Canvas context failed'));
+      if (!ctx) {
+        URL.revokeObjectURL(objectUrl);
+        return reject(new Error('Canvas context failed'));
+      }
 
-      // Maintain aspect ratio
       canvas.width = img.width;
       canvas.height = img.height;
+
+      if (targetMime === 'image/jpeg') {
+        ctx.fillStyle = '#FFFFFF';
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+      }
+
       ctx.drawImage(img, 0, 0);
 
       canvas.toBlob(
         (compressed) => {
+          URL.revokeObjectURL(objectUrl);
           if (compressed) resolve(compressed);
           else reject(new Error('Compression failed'));
         },
-        'image/jpeg',
+        targetMime,
         quality / 100
       );
     };
-    img.onerror = () => reject(new Error('Failed to load image for compression'));
-    img.src = URL.createObjectURL(blob);
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error('Failed to load image for compression'));
+    };
+    img.src = objectUrl;
   });
 }
 
 /**
- * Optimized ZIP-based documents (HWPX, PPTX, SHOW) by iterating and compressing internal images
+ * Optimized ZIP-based documents (HWPX, PPTX, SHOW)
  */
 export const optimizeZipBasedDoc = async (
   file: File, 
   quality: number, 
+  skipPng: boolean, // New option added
   onProgress: (progress: number) => void
 ): Promise<OptimizationResult> => {
   const originalSize = file.size;
@@ -47,12 +66,11 @@ export const optimizeZipBasedDoc = async (
   onProgress(5);
   const zip = await JSZip.loadAsync(file);
   
-  // Find all image files anywhere in the ZIP structure
   const imageFiles = Object.keys(zip.files).filter(path => 
     /\.(jpe?g|png|gif|bmp)$/i.test(path)
   );
 
-  logs.push(`Found ${imageFiles.length} images in the document structure.`);
+  logs.push(`Found ${imageFiles.length} images.`);
 
   if (imageFiles.length === 0) {
     onProgress(100);
@@ -68,12 +86,18 @@ export const optimizeZipBasedDoc = async (
 
   for (let i = 0; i < imageFiles.length; i++) {
     const path = imageFiles[i];
+    
+    // SKIP PNG if requested
+    if (skipPng && path.toLowerCase().endsWith('.png')) {
+      logs.push(`Skipping PNG as requested: ${path}`);
+      continue;
+    }
+
     const originalImage = zip.files[path];
     const imageBytes = await originalImage.async('blob');
     
     try {
       const compressedImage = await compressImage(imageBytes, quality);
-      
       if (compressedImage.size < imageBytes.size) {
         zip.file(path, compressedImage);
       }
@@ -81,12 +105,10 @@ export const optimizeZipBasedDoc = async (
       console.error(`Error processing ${path}: ${e}`);
     }
     
-    // Progress range: 10% to 90%
     const currentProgress = 10 + Math.round((i + 1) / imageFiles.length * 80);
     onProgress(currentProgress);
   }
 
-  // Generate optimized ZIP with high compression level
   const resultBlob = await zip.generateAsync({ 
     type: 'blob', 
     compression: "DEFLATE", 
@@ -94,25 +116,23 @@ export const optimizeZipBasedDoc = async (
   });
   onProgress(100);
   
-  const compressedSize = resultBlob.size;
-  const reductionPercentage = ((originalSize - compressedSize) / originalSize) * 100;
-
   return {
     originalSize,
-    compressedSize,
+    compressedSize: resultBlob.size,
     fileName: file.name,
-    reductionPercentage: Math.max(0, reductionPercentage),
+    reductionPercentage: Math.max(0, ((originalSize - resultBlob.size) / originalSize) * 100),
     blob: resultBlob,
     optimizationLogs: logs
   };
 };
 
 /**
- * Optimizes PDF file by identifying and replacing images with compressed versions.
+ * Optimizes PDF file
  */
 export const optimizePDF = async (
   file: File, 
   quality: number, 
+  skipPng: boolean, // New option added
   onProgress: (progress: number) => void
 ): Promise<OptimizationResult> => {
   const originalSize = file.size;
@@ -120,14 +140,11 @@ export const optimizePDF = async (
   
   onProgress(10);
   const arrayBuffer = await file.arrayBuffer();
-  
-  // Handle encrypted PDFs with ignoreEncryption
   const pdfDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
   
   const pages = pdfDoc.getPages();
   const imageRefs: Set<PDFRef> = new Set();
 
-  // Robust traversal of PDF objects to find images
   pages.forEach((page) => {
     const { node } = page as any;
     const resources = node.get(PDFName.of('Resources'));
@@ -150,7 +167,6 @@ export const optimizePDF = async (
   });
 
   const totalImages = imageRefs.size;
-  logs.push(`Found ${totalImages} unique image objects in PDF.`);
   
   if (totalImages === 0) {
     onProgress(100);
@@ -174,6 +190,13 @@ export const optimizePDF = async (
     }
 
     try {
+      // PDF specific logic: Skip images that have a SoftMask (transparency) if skipPng is on
+      const hasSMask = imageObject.dict.has(PDFName.of('SMask'));
+      if (skipPng && hasSMask) {
+        processedImages++;
+        continue;
+      }
+
       const bytes = imageObject.getContents();
       const blob = new Blob([bytes], { type: 'image/jpeg' });
       
@@ -211,14 +234,11 @@ export const optimizePDF = async (
 
   onProgress(100);
   const resultBlob = new Blob([resultBytes], { type: 'application/pdf' });
-  const compressedSize = resultBlob.size;
-  const reductionPercentage = ((originalSize - compressedSize) / originalSize) * 100;
-
   return {
     originalSize,
-    compressedSize,
+    compressedSize: resultBlob.size,
     fileName: file.name,
-    reductionPercentage: Math.max(0, reductionPercentage),
+    reductionPercentage: Math.max(0, ((originalSize - resultBlob.size) / originalSize) * 100),
     blob: resultBlob,
     optimizationLogs: logs
   };

@@ -9,7 +9,8 @@ import {
   BarChart3, 
   RotateCcw,
   FileText,
-  Zap
+  Zap,
+  AlertCircle
 } from 'lucide-react';
 import Layout from './components/Layout';
 import { OptimizationResult } from './types';
@@ -20,6 +21,7 @@ type TabType = 'HWPX' | 'PDF' | 'PPTX_SHOW';
 const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<TabType>('HWPX');
   const [quality, setQuality] = useState(70);
+  const [skipPng, setSkipPng] = useState(true); // Default to true to be safe
   const [file, setFile] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -45,14 +47,14 @@ const App: React.FC = () => {
     try {
       let res: OptimizationResult;
       if (activeTab === 'HWPX' || activeTab === 'PPTX_SHOW') {
-        res = await optimizeZipBasedDoc(file, quality, (p) => setProgress(p));
+        res = await optimizeZipBasedDoc(file, quality, skipPng, (p) => setProgress(p));
       } else {
-        res = await optimizePDF(file, quality, (p) => setProgress(p));
+        res = await optimizePDF(file, quality, skipPng, (p) => setProgress(p));
       }
       setResult(res);
     } catch (err: any) {
       console.error(err);
-      setError(`오류 발생: ${err.message || '알 수 없는 오류가 발생했습니다.'}\n파일이 손상되었거나 지원하지 않는 형식일 수 있습니다.`);
+      setError(`오류 발생: ${err.message || '알 수 없는 오류가 발생했습니다.'}\n파일이 손상되었거나 브라우저 메모리가 부족할 수 있습니다.`);
     } finally {
       setIsProcessing(false);
     }
@@ -83,7 +85,13 @@ const App: React.FC = () => {
   };
 
   return (
-    <Layout quality={quality} setQuality={setQuality} activeTab={activeTab === 'PPTX_SHOW' ? 'HWPX' : activeTab as any}>
+    <Layout 
+      quality={quality} 
+      setQuality={setQuality} 
+      skipPng={skipPng} 
+      setSkipPng={setSkipPng} 
+      activeTab={activeTab}
+    >
       <div className="flex flex-col gap-8">
         {/* Tab Selection */}
         <div className="flex p-1 bg-slate-200 rounded-xl w-fit flex-wrap gap-1">
@@ -119,7 +127,7 @@ const App: React.FC = () => {
               <Upload className="text-blue-600 w-10 h-10" />
             </div>
             <h2 className="text-2xl font-bold text-slate-900 mb-2">파일을 업로드하세요</h2>
-            <div className="mb-8 flex flex-col items-center gap-1">
+            <div className="mb-8 flex flex-col items-center gap-2">
               <p className="text-slate-500 max-w-sm">
                 최적화할 {activeTab === 'PPTX_SHOW' ? 'PPTX 또는 SHOW' : activeTab} 파일을 선택하거나 이 영역으로 드래그 앤 드롭 하세요.
               </p>
@@ -129,9 +137,14 @@ const App: React.FC = () => {
                 </p>
               )}
               {activeTab === 'PPTX_SHOW' && (
-                <p className="text-blue-600 text-sm font-medium">
-                  * ppt 파일은 pptx 파일로 변환 후 업로드 해주세요.
-                </p>
+                <div className="flex flex-col gap-1 items-center">
+                  <p className="text-blue-600 text-sm font-medium">
+                    * ppt 파일은 pptx 파일로 변환 후 업로드 해주세요.
+                  </p>
+                  <p className="text-slate-400 text-xs flex items-center gap-1">
+                    <AlertCircle size={12} /> 100MB 이상의 대용량 파일은 처리 중 브라우저가 일시적으로 느려질 수 있습니다.
+                  </p>
+                </div>
               )}
             </div>
             
@@ -172,7 +185,11 @@ const App: React.FC = () => {
                       style={{ width: `${progress}%` }}
                     ></div>
                   </div>
-                  <p className="text-xs text-slate-400 mt-2 text-center">문서 용량을 줄이는 중입니다. 잠시만 기다려주세요.</p>
+                  <p className="text-xs text-slate-400 mt-2 text-center">
+                    {file && file.size > 100 * 1024 * 1024 
+                      ? "대용량 파일을 처리 중입니다. 브라우저 창을 닫지 마세요." 
+                      : "문서 용량을 줄이는 중입니다. 잠시만 기다려주세요."}
+                  </p>
                 </div>
               )}
             </div>
