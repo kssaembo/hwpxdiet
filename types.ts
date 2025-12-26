@@ -1,7 +1,9 @@
 
 export enum FileType {
   HWPX = 'HWPX',
-  PDF = 'PDF'
+  PDF = 'PDF',
+  PPTX = 'PPTX',
+  SHOW = 'SHOW'
 }
 
 export interface OptimizationResult {

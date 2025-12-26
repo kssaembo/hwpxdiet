@@ -34,21 +34,27 @@ async function compressImage(blob: Blob, quality: number): Promise<Blob> {
 }
 
 /**
- * Optimized HWPX file by iterating BinData folder and compressing images
+ * Optimized ZIP-based documents (HWPX, PPTX, SHOW) by iterating and compressing internal images
  */
-export const optimizeHWPX = async (
+export const optimizeZipBasedDoc = async (
   file: File, 
   quality: number, 
   onProgress: (progress: number) => void
 ): Promise<OptimizationResult> => {
   const originalSize = file.size;
-  const logs: string[] = [`Starting HWPX optimization: ${file.name}`];
+  const logs: string[] = [`Starting optimization for: ${file.name}`];
   
   onProgress(5);
   const zip = await JSZip.loadAsync(file);
-  const binDataFolder = zip.folder('BinData');
   
-  if (!binDataFolder) {
+  // Find all image files anywhere in the ZIP structure
+  const imageFiles = Object.keys(zip.files).filter(path => 
+    /\.(jpe?g|png|gif|bmp)$/i.test(path)
+  );
+
+  logs.push(`Found ${imageFiles.length} images in the document structure.`);
+
+  if (imageFiles.length === 0) {
     onProgress(100);
     return {
       originalSize,
@@ -60,15 +66,9 @@ export const optimizeHWPX = async (
     };
   }
 
-  const imageFiles = Object.keys(binDataFolder.files).filter(path => 
-    /\.(jpe?g|png|gif|bmp)$/i.test(path)
-  );
-
-  logs.push(`Found ${imageFiles.length} images in BinData.`);
-
   for (let i = 0; i < imageFiles.length; i++) {
     const path = imageFiles[i];
-    const originalImage = binDataFolder.files[path];
+    const originalImage = zip.files[path];
     const imageBytes = await originalImage.async('blob');
     
     try {
@@ -81,10 +81,12 @@ export const optimizeHWPX = async (
       console.error(`Error processing ${path}: ${e}`);
     }
     
+    // Progress range: 10% to 90%
     const currentProgress = 10 + Math.round((i + 1) / imageFiles.length * 80);
     onProgress(currentProgress);
   }
 
+  // Generate optimized ZIP with high compression level
   const resultBlob = await zip.generateAsync({ 
     type: 'blob', 
     compression: "DEFLATE", 
@@ -119,7 +121,7 @@ export const optimizePDF = async (
   onProgress(10);
   const arrayBuffer = await file.arrayBuffer();
   
-  // Handle encrypted PDFs as requested
+  // Handle encrypted PDFs with ignoreEncryption
   const pdfDoc = await PDFDocument.load(arrayBuffer, { ignoreEncryption: true });
   
   const pages = pdfDoc.getPages();
@@ -180,7 +182,6 @@ export const optimizePDF = async (
       if (compressedBlob.size < bytes.length) {
         const compressedBytes = new Uint8Array(await compressedBlob.arrayBuffer());
         
-        // Create new optimized stream while preserving critical metadata
         const newStream = pdfDoc.context.flateStream(compressedBytes, {
           Type: PDFName.of('XObject'),
           Subtype: PDFName.of('Image'),

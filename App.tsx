@@ -13,10 +13,12 @@ import {
 } from 'lucide-react';
 import Layout from './components/Layout';
 import { OptimizationResult } from './types';
-import { optimizeHWPX, optimizePDF } from './services/optimizerService';
+import { optimizeZipBasedDoc, optimizePDF } from './services/optimizerService';
+
+type TabType = 'HWPX' | 'PDF' | 'PPTX_SHOW';
 
 const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'HWPX' | 'PDF'>('HWPX');
+  const [activeTab, setActiveTab] = useState<TabType>('HWPX');
   const [quality, setQuality] = useState(70);
   const [file, setFile] = useState<File | null>(null);
   const [isProcessing, setIsProcessing] = useState(false);
@@ -42,8 +44,8 @@ const App: React.FC = () => {
     setError(null);
     try {
       let res: OptimizationResult;
-      if (activeTab === 'HWPX') {
-        res = await optimizeHWPX(file, quality, (p) => setProgress(p));
+      if (activeTab === 'HWPX' || activeTab === 'PPTX_SHOW') {
+        res = await optimizeZipBasedDoc(file, quality, (p) => setProgress(p));
       } else {
         res = await optimizePDF(file, quality, (p) => setProgress(p));
       }
@@ -71,11 +73,20 @@ const App: React.FC = () => {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
   };
 
+  const getAcceptExtensions = () => {
+    switch(activeTab) {
+      case 'HWPX': return '.hwpx';
+      case 'PDF': return '.pdf';
+      case 'PPTX_SHOW': return '.pptx,.show';
+      default: return '';
+    }
+  };
+
   return (
-    <Layout quality={quality} setQuality={setQuality} activeTab={activeTab}>
+    <Layout quality={quality} setQuality={setQuality} activeTab={activeTab === 'PPTX_SHOW' ? 'HWPX' : activeTab as any}>
       <div className="flex flex-col gap-8">
         {/* Tab Selection */}
-        <div className="flex p-1 bg-slate-200 rounded-xl w-fit">
+        <div className="flex p-1 bg-slate-200 rounded-xl w-fit flex-wrap gap-1">
           <button
             onClick={() => { setActiveTab('HWPX'); reset(); }}
             className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-all ${
@@ -92,6 +103,14 @@ const App: React.FC = () => {
           >
             PDF 압축
           </button>
+          <button
+            onClick={() => { setActiveTab('PPTX_SHOW'); reset(); }}
+            className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-all ${
+              activeTab === 'PPTX_SHOW' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            }`}
+          >
+            PPTX / SHOW 압축
+          </button>
         </div>
 
         {!result ? (
@@ -102,11 +121,16 @@ const App: React.FC = () => {
             <h2 className="text-2xl font-bold text-slate-900 mb-2">파일을 업로드하세요</h2>
             <div className="mb-8 flex flex-col items-center gap-1">
               <p className="text-slate-500 max-w-sm">
-                최적화할 {activeTab} 파일을 선택하거나 이 영역으로 드래그 앤 드롭 하세요.
+                최적화할 {activeTab === 'PPTX_SHOW' ? 'PPTX 또는 SHOW' : activeTab} 파일을 선택하거나 이 영역으로 드래그 앤 드롭 하세요.
               </p>
               {activeTab === 'HWPX' && (
                 <p className="text-blue-600 text-sm font-medium">
                   * hwp 파일은 hwpx 파일로 변환 후 업로드 해주세요.
+                </p>
+              )}
+              {activeTab === 'PPTX_SHOW' && (
+                <p className="text-blue-600 text-sm font-medium">
+                  * ppt 파일은 pptx 파일로 변환 후 업로드 해주세요.
                 </p>
               )}
             </div>
@@ -114,7 +138,7 @@ const App: React.FC = () => {
             <input
               type="file"
               id="fileInput"
-              accept={activeTab === 'HWPX' ? '.hwpx' : '.pdf'}
+              accept={getAcceptExtensions()}
               className="hidden"
               onChange={handleFileChange}
             />
@@ -244,7 +268,7 @@ const App: React.FC = () => {
               어떻게 압축되나요?
             </h4>
             <p className="text-sm text-slate-600 leading-relaxed">
-              HWPX 파일은 내부의 이미지를 찾아 설정하신 품질로 재인코딩합니다. PDF는 문서 내부의 고해상도 이미지를 추출하여 JPEG로 다시 인코딩하고 용량을 줄입니다. 텍스트 레이아웃은 보존됩니다.
+              HWPX, PPTX, SHOW 파일은 내부의 이미지 자산을 찾아 설정하신 품질로 재인코딩합니다. PDF는 문서 내부의 고해상도 이미지를 추출하여 최적화하고 용량을 줄입니다. 텍스트 레이아웃은 보존됩니다.
             </p>
           </div>
           <div className="bg-white p-6 rounded-2xl border border-slate-200">
