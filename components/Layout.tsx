@@ -57,6 +57,7 @@ const Layout: React.FC<LayoutProps> = ({
             />
             <div className="flex justify-between mt-1 mb-4">
               <span className="text-[10px] text-slate-400">고압축</span>
+              <span className="text-[10px] text-blue-500 font-bold">권장: 60% ~ 80%</span>
               <span className="text-[10px] text-slate-400">고화질</span>
             </div>
 
@@ -105,7 +106,7 @@ const Layout: React.FC<LayoutProps> = ({
             </span>
           </div>
           <div className="flex items-center gap-4 text-xs text-slate-400">
-            <span className="hidden sm:inline">v1.2.0 Stable</span>
+            <span className="hidden sm:inline">v1.2.1 Stable</span>
           </div>
         </header>
 

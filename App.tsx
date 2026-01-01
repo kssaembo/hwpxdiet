@@ -10,7 +10,8 @@ import {
   RotateCcw,
   FileText,
   Zap,
-  AlertCircle
+  AlertCircle,
+  ShieldAlert
 } from 'lucide-react';
 import Layout from './components/Layout';
 import { OptimizationResult } from './types';
@@ -31,6 +32,20 @@ const App: React.FC = () => {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selected = e.target.files?.[0];
     if (selected) {
+      const fileName = selected.name.toLowerCase();
+      
+      // Legacy format validation
+      if (fileName.endsWith('.hwp')) {
+        setError("HWP 파일은 지원하지 않습니다. 한글 프로그램에서 '다른 이름으로 저장'을 통해 .hwpx 형식으로 변환 후 다시 시도해주세요.");
+        setFile(null);
+        return;
+      }
+      if (fileName.endsWith('.ppt')) {
+        setError("PPT 파일은 지원하지 않습니다. 파워포인트에서 '다른 이름으로 저장'을 통해 .pptx 형식으로 변환 후 다시 시도해주세요.");
+        setFile(null);
+        return;
+      }
+
       setFile(selected);
       setResult(null);
       setError(null);
@@ -40,6 +55,14 @@ const App: React.FC = () => {
 
   const runOptimization = async () => {
     if (!file) return;
+
+    // Large file confirmation
+    if (file.size > 100 * 1024 * 1024) {
+      const proceed = window.confirm(
+        "100MB 이상의 대용량 파일은 변환 과정에서 시간이 오래 걸리거나 브라우저가 일시적으로 멈추는 등의 문제가 발생할 수 있습니다.\n\n계속 진행하시겠습니까?"
+      );
+      if (!proceed) return;
+    }
 
     setIsProcessing(true);
     setProgress(0);
@@ -54,7 +77,7 @@ const App: React.FC = () => {
       setResult(res);
     } catch (err: any) {
       console.error(err);
-      setError(`오류 발생: ${err.message || '알 수 없는 오류가 발생했습니다.'}\n파일이 손상되었거나 브라우저 메모리가 부족할 수 있습니다.`);
+      setError(`오류 발생: ${err.message || '알 수 없는 오류가 발생했습니다.'}\n파일이 손상되었거나 브라우저 메모리가 부족할 수 있습니다.\n특히 DRM(문서보안)이 적용된 파일은 최적화가 불가능합니다.`);
     } finally {
       setIsProcessing(false);
     }
@@ -131,17 +154,21 @@ const App: React.FC = () => {
               <p className="text-slate-500 max-w-sm">
                 최적화할 {activeTab === 'PPTX_SHOW' ? 'PPTX 또는 SHOW' : activeTab} 파일을 선택하거나 이 영역으로 드래그 앤 드롭 하세요.
               </p>
+              <div className="bg-amber-50 border border-amber-100 px-4 py-2 rounded-lg flex items-center gap-2 text-amber-700 text-xs mt-2">
+                <ShieldAlert size={14} />
+                <span>DRM(문서보안) 적용 파일은 지원하지 않습니다.</span>
+              </div>
               {activeTab === 'HWPX' && (
-                <p className="text-blue-600 text-sm font-medium">
+                <p className="text-blue-600 text-sm font-medium mt-1">
                   * hwp 파일은 hwpx 파일로 변환 후 업로드 해주세요.
                 </p>
               )}
               {activeTab === 'PPTX_SHOW' && (
                 <div className="flex flex-col gap-1 items-center">
-                  <p className="text-blue-600 text-sm font-medium">
+                  <p className="text-blue-600 text-sm font-medium mt-1">
                     * ppt 파일은 pptx 파일로 변환 후 업로드 해주세요.
                   </p>
-                  <p className="text-slate-400 text-xs flex items-center gap-1">
+                  <p className="text-slate-400 text-xs flex items-center gap-1 mt-1">
                     <AlertCircle size={12} /> 100MB 이상의 대용량 파일은 처리 중 브라우저가 일시적으로 느려질 수 있습니다.
                   </p>
                 </div>
