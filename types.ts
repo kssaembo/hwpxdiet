@@ -13,6 +13,9 @@ export interface OptimizationResult {
   reductionPercentage: number;
   blob: Blob;
   optimizationLogs: string[];
+  targetSize?: number;
+  targetAchieved?: boolean;
+  warning?: string;
 }
 
 export interface FileState {

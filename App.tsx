@@ -1,5 +1,5 @@
 
-import React, { useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { 
   Upload, 
   Download, 
@@ -29,9 +29,16 @@ const App: React.FC = () => {
   const [result, setResult] = useState<OptimizationResult | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0];
-    if (selected) {
+  const resultUrl = useMemo(
+    () => result ? URL.createObjectURL(result.blob) : null,
+    [result]
+  );
+
+  useEffect(() => () => {
+    if (resultUrl) URL.revokeObjectURL(resultUrl);
+  }, [resultUrl]);
+
+  const selectFile = (selected: File) => {
       const fileName = selected.name.toLowerCase();
       
       // Legacy format validation
@@ -46,11 +53,26 @@ const App: React.FC = () => {
         return;
       }
 
+      const isExpectedType = activeTab === 'HWPX'
+        ? fileName.endsWith('.hwpx')
+        : activeTab === 'PDF'
+          ? fileName.endsWith('.pdf')
+          : fileName.endsWith('.pptx') || fileName.endsWith('.show');
+      if (!isExpectedType) {
+        setError(`${activeTab === 'PPTX_SHOW' ? 'PPTX 또는 SHOW' : activeTab} 파일을 선택해주세요.`);
+        setFile(null);
+        return;
+      }
+
       setFile(selected);
       setResult(null);
       setError(null);
       setProgress(0);
-    }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selected = e.target.files?.[0];
+    if (selected) selectFile(selected);
   };
 
   const runOptimization = async () => {
@@ -145,7 +167,15 @@ const App: React.FC = () => {
         </div>
 
         {!result ? (
-          <div className="bg-white border-2 border-dashed border-slate-200 rounded-3xl p-12 flex flex-col items-center text-center">
+          <div
+            className="bg-white border-2 border-dashed border-slate-200 rounded-3xl p-12 flex flex-col items-center text-center"
+            onDragOver={(event) => event.preventDefault()}
+            onDrop={(event) => {
+              event.preventDefault();
+              const droppedFile = event.dataTransfer.files?.[0];
+              if (droppedFile) selectFile(droppedFile);
+            }}
+          >
             <div className="w-20 h-20 bg-blue-50 rounded-full flex items-center justify-center mb-6">
               <Upload className="text-blue-600 w-10 h-10" />
             </div>
@@ -241,7 +271,13 @@ const App: React.FC = () => {
                   </div>
                   <div>
                     <h3 className="text-xl font-bold text-slate-900">최적화 완료!</h3>
-                    <p className="text-sm text-slate-500">파일 용량이 획기적으로 줄어들었습니다.</p>
+                    <p className="text-sm text-slate-500">
+                      {result.targetAchieved === false
+                        ? '문서 구조상 가능한 범위까지 최적화했습니다.'
+                        : result.targetAchieved === true
+                          ? '설정한 목표에 맞춰 파일을 최적화했습니다.'
+                          : '파일의 이미지와 패키지 구조를 최적화했습니다.'}
+                    </p>
                   </div>
                 </div>
                 <div className="flex items-center gap-3">
@@ -252,7 +288,7 @@ const App: React.FC = () => {
                     <RotateCcw size={16} /> 다시하기
                   </button>
                   <a
-                    href={URL.createObjectURL(result.blob)}
+                    href={resultUrl || undefined}
                     download={`optimized_${result.fileName}`}
                     className="flex items-center gap-2 px-6 py-2 rounded-lg bg-blue-600 text-white font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-100"
                   >
@@ -262,6 +298,12 @@ const App: React.FC = () => {
               </div>
 
               <div className="p-8">
+                {result.warning && (
+                  <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800 flex items-start gap-2">
+                    <AlertCircle size={18} className="shrink-0 mt-0.5" />
+                    <span>{result.warning}</span>
+                  </div>
+                )}
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
                   <div className="p-6 rounded-2xl bg-slate-50 border border-slate-100">
                     <span className="text-xs font-semibold text-slate-400 uppercase">원본 용량</span>

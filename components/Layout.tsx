@@ -43,7 +43,7 @@ const Layout: React.FC<LayoutProps> = ({
           <div className="bg-slate-50 p-4 rounded-xl border border-slate-100 mt-2">
             <div className="flex items-center justify-between mb-2">
               <label className="text-sm font-medium text-slate-700 flex items-center gap-2">
-                <Settings size={16} /> 압축률
+                <Settings size={16} /> {activeTab === 'PDF' ? '목표 용량' : '이미지 품질'}
               </label>
               <span className="text-sm font-bold text-blue-600">{quality}%</span>
             </div>
@@ -57,10 +57,18 @@ const Layout: React.FC<LayoutProps> = ({
             />
             <div className="flex justify-between mt-1 mb-4">
               <span className="text-[10px] text-slate-400">고압축</span>
-              <span className="text-[10px] text-blue-500 font-bold">권장: 60% ~ 80%</span>
-              <span className="text-[10px] text-slate-400">고화질</span>
+              <span className="text-[10px] text-blue-500 font-bold">
+                {activeTab === 'PDF' ? '원본 대비 목표 비율' : '권장: 60% ~ 80%'}
+              </span>
+              <span className="text-[10px] text-slate-400">높은 품질</span>
             </div>
+            {activeTab === 'PDF' && (
+              <p className="text-[10px] text-slate-400 mb-4 leading-tight">
+                예: 70%는 원본 용량의 약 70%를 목표로 반복 최적화합니다.
+              </p>
+            )}
 
+            {activeTab !== 'PDF' && (
             <div className="pt-4 border-t border-slate-200">
               <label className="flex items-center gap-3 cursor-pointer group">
                 <div className="relative flex items-center">
@@ -82,6 +90,7 @@ const Layout: React.FC<LayoutProps> = ({
                 투명 배경 이미지를 원본 그대로 유지하여 검은 배경 현상을 방지합니다.
               </p>
             </div>
+            )}
           </div>
         </nav>
 
@@ -115,7 +124,7 @@ const Layout: React.FC<LayoutProps> = ({
         </div>
 
         <footer className="py-8 text-center text-slate-400 text-sm border-t border-slate-100 bg-white">
-          ⓒ 2025. Kwon's class. All rights reserved.
+          ⓒ 2026. Kwon's class. All rights reserved.
         </footer>
       </main>
     </div>
