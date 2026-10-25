@@ -1,778 +1,196 @@
-
 import JSZip from 'jszip';
-import { PDFDocument, PDFName, PDFRawStream, PDFDict, PDFRef } from 'pdf-lib';
-import pako from 'pako';
-import { OptimizationResult } from '../types';
+import { PDFDocument, PDFName, PDFNumber, PDFRef, PDFRawStream, PDFDict, PDFArray, PDFBool } from 'pdf-lib';
+import { cancelled, encodeImage, identifyImage } from './image';
+import { inflateBounded, unpackPixels } from './pdfPixels';
+import type { Options, Progress, OptimizationResult } from '../types';
 
-/**
- * Compresses an image blob using Canvas API while preserving transparency for PNG/GIF
- */
-interface EncodedImage {
-  blob: Blob;
-  width: number;
-  height: number;
+type Report = (value: Progress) => void;
+interface ImageAsset { key: string; bytes: Uint8Array; mime: 'image/jpeg' | 'image/png' }
+const yieldUI = () => new Promise<void>(resolve => window.setTimeout(resolve, 0));
+const limitFile = (file: File) => { if (!file.size) throw new Error('비어 있는 파일입니다.'); if (file.size > 150 * 1024 * 1024) throw new Error('이 버전은 150MB 이하 파일을 지원합니다.'); };
+const plan = (minimum: number) => [
+  { quality: .86, side: 2600 }, { quality: .76, side: 2100 }, { quality: .65, side: 1700 },
+  { quality: .53, side: 1350 }, { quality: .42, side: 1100 }, { quality: .32, side: 900 },
+  { quality: .23, side: 700 }, { quality: .15, side: 500 },
+].filter((step, i, steps) => i === 0 || Math.max(step.side, minimum) !== Math.max(steps[i - 1].side, minimum) || step.quality !== steps[i - 1].quality).map(step => ({ ...step, side: Math.max(minimum, step.side) }));
+
+function result(file: File, best: Blob, target: number, changed: number, skipped: number, attempts: number, logs: string[]): OptimizationResult {
+  const saved = Math.max(0, 100 * (1 - best.size / file.size));
+  const achieved = best.size <= target;
+  if (!achieved) logs.push('목표에 도달하지 못했습니다. 이미지 외 데이터, 보호된 이미지 또는 화질 하한이 제한 요인일 수 있습니다.');
+  if (best === file) logs.push('더 작은 결과를 만들지 못해 원본 파일을 반환했습니다.');
+  return { originalSize: file.size, compressedSize: best.size, blob: best, fileName: file.name, targetSize: target, achieved, reductionPercentage: saved, changedImages: changed, skippedImages: skipped, attempts, logs };
 }
 
-const getMaxDimension = (quality: number): number => {
-  if (quality <= 20) return 640;
-  if (quality <= 45) return 840;
-  if (quality <= 60) return 1024;
-  if (quality <= 75) return 1280;
-  if (quality <= 85) return 1600;
-  if (quality <= 95) return 2048;
-  return 3072;
-};
-
-async function compressImage(
-  blob: Blob,
-  quality: number,
-  forceFormat?: string,
-  maxDimension?: number
-): Promise<EncodedImage> {
-  const originalType = blob.type;
-  const isPng = originalType.includes('png');
-  const targetMime = forceFormat || (isPng ? 'image/png' : 'image/jpeg');
-  
-  const objectUrl = URL.createObjectURL(blob);
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        URL.revokeObjectURL(objectUrl);
-        return reject(new Error('Canvas context failed'));
-      }
-
-      const maxDim = maxDimension ?? getMaxDimension(quality);
-
-      // Max dimension check (Downscaling)
-      let targetWidth = img.width;
-      let targetHeight = img.height;
-      if (img.width > maxDim || img.height > maxDim) {
-        const ratio = Math.min(maxDim / img.width, maxDim / img.height);
-        targetWidth = Math.round(img.width * ratio);
-        targetHeight = Math.round(img.height * ratio);
-      }
-
-      canvas.width = targetWidth;
-      canvas.height = targetHeight;
-
-      if (targetMime === 'image/jpeg') {
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(0, 0, targetWidth, targetHeight);
-      }
-
-      ctx.drawImage(img, 0, 0, img.width, img.height, 0, 0, targetWidth, targetHeight);
-
-      canvas.toBlob(
-        (compressed) => {
-          URL.revokeObjectURL(objectUrl);
-          if (compressed) resolve({ blob: compressed, width: targetWidth, height: targetHeight });
-          else reject(new Error('Compression failed'));
-        },
-        targetMime,
-        quality / 100
-      );
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(objectUrl);
-      reject(new Error('Failed to load image for compression'));
-    };
-    img.src = objectUrl;
-  });
-}
-
-/**
- * Optimized ZIP-based documents (HWPX, PPTX, SHOW)
- */
-export const optimizeZipBasedDoc = async (
-  file: File, 
-  quality: number, 
-  skipPng: boolean, // New option added
-  onProgress: (progress: number) => void
-): Promise<OptimizationResult> => {
-  const originalSize = file.size;
-  const logs: string[] = [`Starting optimization for: ${file.name}`];
-  
-  onProgress(5);
-  const zip = await JSZip.loadAsync(file);
-  
-  const imageFiles = Object.keys(zip.files).filter(path => 
-    /\.(jpe?g|png|gif|bmp)$/i.test(path)
-  );
-
-  logs.push(`Found ${imageFiles.length} images.`);
-
-  if (imageFiles.length === 0) {
-    onProgress(100);
-    return {
-      originalSize,
-      compressedSize: originalSize,
-      fileName: file.name,
-      reductionPercentage: 0,
-      blob: file,
-      optimizationLogs: logs
-    };
+export async function optimizeZipBasedDoc(file: File, options: Options, report: Report): Promise<OptimizationResult> {
+  limitFile(file); cancelled(options.signal);
+  const target = Math.max(1, Math.floor(file.size * (1 - options.reduction / 100)));
+  report({ percent: 2, message: '문서 구조와 이미지 확인 중' });
+  const original = await JSZip.loadAsync(file);
+  const names = Object.keys(original.files);
+  if (names.length > 10000) throw new Error('문서 내부 파일 수가 너무 많습니다.');
+  const estimated = Object.values(original.files).reduce((sum, entry) => sum + (Number((entry as unknown as { _data?: { uncompressedSize?: number } })._data?.uncompressedSize) || 0), 0);
+  if (estimated > 300 * 1024 * 1024) throw new Error('압축을 푼 데이터가 300MB를 넘습니다. 문서를 나눠 처리해 주세요.');
+  if (/\.hwpx$/i.test(file.name) && !original.file('Contents/content.hpf')) throw new Error('HWPX 문서 구조를 확인하지 못했습니다.');
+  if (/\.pptx$/i.test(file.name) && !original.file('[Content_Types].xml')) throw new Error('PPTX 문서 구조를 확인하지 못했습니다.');
+  if (names.some(name => /(^|\/)(_xmlsignatures|signatures)(\/|\.)/i.test(name))) throw new Error('전자서명이 포함된 문서는 서명 보존을 위해 처리하지 않습니다.');
+  const imageNames = names.filter(name => !original.files[name].dir && /\.(png|jpe?g|gif|bmp|webp|tiff?)$/i.test(name));
+  if (imageNames.length > 500) throw new Error('이미지가 500개를 넘습니다. 문서를 나눠 처리해 주세요.');
+  const assets: ImageAsset[] = [], logs: string[] = []; let skipped = 0;
+  for (const name of imageNames) {
+    cancelled(options.signal);
+    if (!/\.(png|jpe?g)$/i.test(name) || options.protectPng && /\.png$/i.test(name)) { skipped++; continue; }
+    const bytes = await original.file(name)!.async('uint8array');
+    const mime = identifyImage(bytes);
+    if (!mime || (mime === 'image/png') !== /\.png$/i.test(name)) { skipped++; logs.push(`형식 불일치 또는 미지원 이미지 원본 유지: ${name}`); continue; }
+    assets.push({ key: name, bytes, mime });
   }
-
-  for (let i = 0; i < imageFiles.length; i++) {
-    const path = imageFiles[i];
-    
-    // SKIP PNG if requested
-    if (skipPng && path.toLowerCase().endsWith('.png')) {
-      logs.push(`Skipping PNG as requested: ${path}`);
-      continue;
+  let best: Blob = file, bestChanged = 0, attempts = 0;
+  const steps = assets.length ? plan(options.minimumSide) : [{ quality: 1, side: 2600 }];
+  const failed = new Set<string>();
+  for (let pass = 0; pass < steps.length; pass++) {
+    cancelled(options.signal); attempts++;
+    const { quality, side } = steps[pass];
+    const zip = new JSZip();
+    // HWPX requires mimetype at the beginning, uncompressed.
+    if (original.file('mimetype')) zip.file('mimetype', await original.file('mimetype')!.async('uint8array'), { compression: 'STORE' });
+    for (const name of names) {
+      if (name === 'mimetype') continue;
+      const entry = original.files[name];
+      zip.file(name, entry.async('uint8array'), { dir: entry.dir, date: entry.date, comment: entry.comment, unixPermissions: entry.unixPermissions, dosPermissions: entry.dosPermissions });
     }
-
-    const originalImage = zip.files[path];
-    const extension = path.split('.').pop()?.toLowerCase();
-    const mimeType = extension === 'png'
-      ? 'image/png'
-      : extension === 'gif'
-        ? 'image/gif'
-        : extension === 'bmp'
-          ? 'image/bmp'
-          : 'image/jpeg';
-    const imageBytes = new Blob([await originalImage.async('uint8array')], { type: mimeType });
-    
-    try {
-      const compressedImage = await compressImage(imageBytes, quality);
-      if (compressedImage.blob.size < imageBytes.size) {
-        // Keep the original file extension and its declared package content type valid.
-        const sourceExt = path.split('.').pop()?.toLowerCase();
-        const encodedExt = compressedImage.blob.type === 'image/jpeg' ? 'jpeg' : 'png';
-        const extensionMatches = sourceExt === encodedExt || (sourceExt === 'jpg' && encodedExt === 'jpeg');
-        if (extensionMatches) {
-          zip.file(path, compressedImage.blob);
-        } else {
-          logs.push(`Skipping ${path}: recompression would change the image format without updating document relationships.`);
-        }
-      }
-    } catch (e) {
-      console.error(`Error processing ${path}: ${e}`);
-    }
-    
-    const currentProgress = 10 + Math.round((i + 1) / imageFiles.length * 80);
-    onProgress(currentProgress);
-  }
-
-  // HWPX packages expect the mimetype entry to remain uncompressed.
-  const mimetypeEntry = zip.file('mimetype');
-  if (mimetypeEntry) {
-    zip.file('mimetype', await mimetypeEntry.async('uint8array'), { compression: 'STORE' });
-  }
-
-  const resultBlob = await zip.generateAsync({ 
-    type: 'blob', 
-    compression: "DEFLATE", 
-    compressionOptions: { level: 9 } 
-  });
-  onProgress(100);
-  
-  return {
-    originalSize,
-    compressedSize: resultBlob.size,
-    fileName: file.name,
-    reductionPercentage: Math.max(0, ((originalSize - resultBlob.size) / originalSize) * 100),
-    blob: resultBlob,
-    optimizationLogs: logs
-  };
-};
-
-/**
- * Safe numeric getter for PDF values
- */
-const getNumericValue = (obj: any): number | null => {
-  if (typeof obj === 'number') return obj;
-  if (!obj) return null;
-  if (typeof obj.asNumber === 'function') return obj.asNumber();
-  if (typeof obj.value === 'number') return obj.value;
-  return null;
-};
-
-/**
- * Checks if PDF filter dictates DCTDecode (JPEG)
- */
-const hasDCTFilter = (filterObj: any): boolean => {
-  if (!filterObj) return false;
-  if (filterObj === PDFName.of('DCTDecode')) return true;
-  if (filterObj instanceof PDFName && filterObj.decodeText() === 'DCTDecode') return true;
-  if (typeof filterObj.asArray === 'function') {
-    const array = filterObj.asArray();
-    return array.some((f: any) => hasDCTFilter(f));
-  }
-  if (Array.isArray(filterObj)) {
-    return filterObj.some((f: any) => hasDCTFilter(f));
-  }
-  return false;
-};
-
-/**
- * Checks if PDF filter dictates FlateDecode
- */
-const hasFlateFilter = (filterObj: any): boolean => {
-  if (!filterObj) return false;
-  if (filterObj === PDFName.of('FlateDecode')) return true;
-  if (filterObj instanceof PDFName && filterObj.decodeText() === 'FlateDecode') return true;
-  if (typeof filterObj.asArray === 'function') {
-    const array = filterObj.asArray();
-    return array.some((f: any) => hasFlateFilter(f));
-  }
-  if (Array.isArray(filterObj)) {
-    return filterObj.some((f: any) => hasFlateFilter(f));
-  }
-  return false;
-};
-
-/**
- * Decodes PNG predictor format (Predictor >= 10)
- */
-function decodePngPredictor(
-  compressedBytes: Uint8Array,
-  width: number,
-  height: number,
-  bitsPerComponent: number,
-  colorspaceComponents: number,
-  predictor: number
-): Uint8Array {
-  const bpp = Math.max(1, Math.ceil((bitsPerComponent * colorspaceComponents) / 8));
-  const bytesPerRow = Math.ceil((width * bitsPerComponent * colorspaceComponents) / 8);
-  const rowLength = bytesPerRow + 1; // 1 byte for predictor type + row
-  
-  const decodedBytes = new Uint8Array(height * bytesPerRow);
-  
-  let srcPos = 0;
-  for (let r = 0; r < height; r++) {
-    if (srcPos >= compressedBytes.length) break;
-    const predictorType = compressedBytes[srcPos];
-    srcPos++;
-    
-    const rowStart = r * bytesPerRow;
-    for (let c = 0; c < bytesPerRow; c++) {
-      if (srcPos + c >= compressedBytes.length) break;
-      const rawByte = compressedBytes[srcPos + c];
-      const left = c >= bpp ? decodedBytes[rowStart + c - bpp] : 0;
-      const up = r > 0 ? decodedBytes[rowStart - bytesPerRow + c] : 0;
-      const upLeft = (r > 0 && c >= bpp) ? decodedBytes[rowStart - bytesPerRow + c - bpp] : 0;
-      
-      let val = 0;
-      switch (predictorType) {
-        case 0: // None
-          val = rawByte;
-          break;
-        case 1: // Sub
-          val = (rawByte + left) & 0xff;
-          break;
-        case 2: // Up
-          val = (rawByte + up) & 0xff;
-          break;
-        case 3: // Average
-          val = (rawByte + Math.floor((left + up) / 2)) & 0xff;
-          break;
-        case 4: // Paeth
-          const p = left + up - upLeft;
-          const pa = Math.abs(p - left);
-          const pb = Math.abs(p - up);
-          const pc = Math.abs(p - upLeft);
-          let paeth = 0;
-          if (pa <= pb && pa <= pc) paeth = left;
-          else if (pb <= pc) paeth = up;
-          else paeth = upLeft;
-          val = (rawByte + paeth) & 0xff;
-          break;
-        default:
-          val = rawByte;
-      }
-      decodedBytes[rowStart + c] = val;
-    }
-    srcPos += bytesPerRow;
-  }
-  return decodedBytes;
-}
-
-/**
- * Unpacks packed sub-8-bit component depths (e.g., 1-bit, 2-bit, 4-bit)
- */
-function unpackSub8BitBytes(
-  packedBytes: Uint8Array,
-  width: number,
-  height: number,
-  bitsPerComponent: number
-): Uint8Array {
-  if (bitsPerComponent === 8) return packedBytes;
-  
-  const unpacked = new Uint8Array(width * height);
-  const mask = (1 << bitsPerComponent) - 1;
-  const pixelsPerByte = 8 / bitsPerComponent;
-  
-  let srcIdx = 0;
-  let dstIdx = 0;
-  
-  for (let r = 0; r < height; r++) {
-    const bytesPerRow = Math.ceil((width * bitsPerComponent) / 8);
-    const rowBytes = packedBytes.subarray(srcIdx, srcIdx + bytesPerRow);
-    srcIdx += bytesPerRow;
-    
-    let col = 0;
-    for (let i = 0; i < rowBytes.length && col < width; i++) {
-      const b = rowBytes[i];
-      for (let p = 0; p < pixelsPerByte && col < width; p++) {
-        const shift = 8 - bitsPerComponent * (p + 1);
-        const val = (b >> shift) & mask;
-        unpacked[dstIdx++] = val;
-        col++;
-      }
-    }
-  }
-  
-  return unpacked;
-}
-
-/**
- * Resolves PDF Colorspace names, references, arrays and indexed tables
- */
-function resolveColorSpace(
-  csObj: any,
-  context: any
-): { type: string; components: number; palette?: Uint8Array } {
-  if (!csObj) {
-    return { type: 'RGB', components: 3 };
-  }
-
-  if (csObj instanceof PDFRef) {
-    csObj = context.lookup(csObj);
-  }
-
-  if (csObj instanceof PDFName) {
-    const name = csObj.decodeText();
-    if (name === 'DeviceRGB' || name === 'CalRGB') {
-      return { type: 'RGB', components: 3 };
-    }
-    if (name === 'DeviceGray' || name === 'CalGray') {
-      return { type: 'Gray', components: 1 };
-    }
-    if (name === 'DeviceCMYK') {
-      return { type: 'CMYK', components: 4 };
-    }
-    return { type: 'RGB', components: 3 };
-  }
-
-  if (Array.isArray(csObj) || (csObj && typeof csObj.asArray === 'function')) {
-    const arr = Array.isArray(csObj) ? csObj : csObj.asArray();
-    if (arr.length === 0) return { type: 'RGB', components: 3 };
-    
-    let first = arr[0];
-    if (first instanceof PDFRef) first = context.lookup(first);
-    if (!(first instanceof PDFName)) return { type: 'RGB', components: 3 };
-
-    const csName = first.decodeText();
-
-    if (csName === 'Indexed') {
-      const baseCS = arr[1];
-      const hivalObj = arr[2];
-      let lookupObj = arr[3];
-
-      const hival = getNumericValue(hivalObj) || 255;
-      
-      if (lookupObj instanceof PDFRef) {
-        lookupObj = context.lookup(lookupObj);
-      }
-
-      let palette: Uint8Array;
-      if (lookupObj instanceof PDFRawStream) {
-        palette = lookupObj.getContents();
-      } else if (typeof lookupObj.asBytes === 'function') {
-        palette = lookupObj.asBytes();
-      } else if (typeof lookupObj.value === 'string') {
-        const strVal = lookupObj.value;
-        const bytes = [];
-        for (let i = 0; i < strVal.length; i++) {
-          bytes.push(strVal.charCodeAt(i) & 0xff);
-        }
-        palette = new Uint8Array(bytes);
-      } else if (lookupObj && lookupObj.asString) {
-        const strVal = lookupObj.asString();
-        const bytes = [];
-        for (let i = 0; i < strVal.length; i++) {
-          bytes.push(strVal.charCodeAt(i) & 0xff);
-        }
-        palette = new Uint8Array(bytes);
-      } else {
-        palette = new Uint8Array();
-      }
-
-      return { type: 'Indexed', components: 1, palette };
-    }
-
-    if (csName === 'ICCBased') {
-      let iccStream = arr[1];
-      if (iccStream instanceof PDFRef) {
-        iccStream = context.lookup(iccStream);
-      }
-      if (iccStream instanceof PDFRawStream) {
-        const nObj = iccStream.dict.get(PDFName.of('N'));
-        const nComp = getNumericValue(nObj) || 3;
-        if (nComp === 4) return { type: 'CMYK', components: 4 };
-        if (nComp === 3) return { type: 'RGB', components: 3 };
-        if (nComp === 1) return { type: 'Gray', components: 1 };
-      }
-      return { type: 'RGB', components: 3 };
-    }
-  }
-
-  return { type: 'RGB', components: 3 };
-}
-
-/**
- * Converts unpredicted stream bytes to raw RGB format
- */
-function convertToRGB(
-  decodedBytes: Uint8Array,
-  width: number,
-  height: number,
-  bitsPerComponent: number,
-  csInfo: { type: string; components: number; palette?: Uint8Array }
-): Uint8Array {
-  const pixelCount = width * height;
-  const rgbBytes = new Uint8Array(pixelCount * 3);
-  
-  let bytes = decodedBytes;
-  if (bitsPerComponent < 8 && (csInfo.type === 'Gray' || csInfo.type === 'Indexed')) {
-    bytes = unpackSub8BitBytes(decodedBytes, width, height, bitsPerComponent);
-    bitsPerComponent = 8;
-  }
-  
-  let srcPos = 0;
-  let dstPos = 0;
-  
-  if (csInfo.type === 'RGB') {
-    if (bytes.length >= pixelCount * 3) {
-      return bytes.subarray(0, pixelCount * 3);
-    } else {
-      rgbBytes.set(bytes.subarray(0, bytes.length));
-      return rgbBytes;
-    }
-  } else if (csInfo.type === 'Gray') {
-    const maxVal = (1 << bitsPerComponent) - 1;
-    const scale = bitsPerComponent < 8 ? (255 / maxVal) : 1;
-    
-    for (let i = 0; i < pixelCount; i++) {
-      const g = Math.round((bytes[i] || 0) * scale);
-      rgbBytes[dstPos] = g;
-      rgbBytes[dstPos + 1] = g;
-      rgbBytes[dstPos + 2] = g;
-      dstPos += 3;
-    }
-  } else if (csInfo.type === 'CMYK') {
-    for (let i = 0; i < pixelCount; i++) {
-      const idx = i * 4;
-      const c = (bytes[idx] || 0) / 255;
-      const m = (bytes[idx + 1] || 0) / 255;
-      const y = (bytes[idx + 2] || 0) / 255;
-      const k = (bytes[idx + 3] || 0) / 255;
-      
-      rgbBytes[dstPos] = Math.round(255 * (1 - c) * (1 - k));
-      rgbBytes[dstPos + 1] = Math.round(255 * (1 - m) * (1 - k));
-      rgbBytes[dstPos + 2] = Math.round(255 * (1 - y) * (1 - k));
-      dstPos += 3;
-    }
-  } else if (csInfo.type === 'Indexed') {
-    const palette = csInfo.palette || new Uint8Array();
-    const paletteSize = palette.length;
-    
-    for (let i = 0; i < pixelCount; i++) {
-      const index = bytes[i] || 0;
-      const palIdx = index * 3;
-      if (palIdx + 2 < paletteSize) {
-        rgbBytes[dstPos] = palette[palIdx];
-        rgbBytes[dstPos + 1] = palette[palIdx + 1];
-        rgbBytes[dstPos + 2] = palette[palIdx + 2];
-      } else {
-        rgbBytes[dstPos] = 255;
-        rgbBytes[dstPos + 1] = 255;
-        rgbBytes[dstPos + 2] = 255;
-      }
-      dstPos += 3;
-    }
-  } else {
-    rgbBytes.set(bytes.subarray(0, Math.min(bytes.length, rgbBytes.length)));
-  }
-  
-  return rgbBytes;
-}
-
-/**
- * Compresses standard RGB pixels using a canvas, with auto-downscaling for oversized images
- */
-async function compressRGBPixels(
-  rgbBytes: Uint8Array,
-  width: number,
-  height: number,
-  quality: number,
-  logs: string[],
-  maxDimension?: number
-): Promise<EncodedImage | null> {
-  return new Promise((resolve) => {
-    try {
-      // 1. Create source canvas with original size
-      const srcCanvas = document.createElement('canvas');
-      srcCanvas.width = width;
-      srcCanvas.height = height;
-      const srcCtx = srcCanvas.getContext('2d');
-      if (!srcCtx) return resolve(null);
-
-      const imgData = srcCtx.createImageData(width, height);
-      const data = imgData.data;
-
-      let rIdx = 0;
-      let wIdx = 0;
-      const totalPixels = width * height;
-
-      for (let i = 0; i < totalPixels; i++) {
-        data[wIdx] = rgbBytes[rIdx];
-        data[wIdx + 1] = rgbBytes[rIdx + 1];
-        data[wIdx + 2] = rgbBytes[rIdx + 2];
-        data[wIdx + 3] = 255;
-        rIdx += 3;
-        wIdx += 4;
-      }
-      srcCtx.putImageData(imgData, 0, 0);
-
-      const maxDim = maxDimension ?? getMaxDimension(quality);
-
-      // 2. Downscale if oversized
-      let targetWidth = width;
-      let targetHeight = height;
-      if (width > maxDim || height > maxDim) {
-        const ratio = Math.min(maxDim / width, maxDim / height);
-        targetWidth = Math.round(width * ratio);
-        targetHeight = Math.round(height * ratio);
-        logs.push(`Resizing oversized raw stream from ${width}x${height} to ${targetWidth}x${targetHeight}`);
-      }
-
-      const destCanvas = document.createElement('canvas');
-      destCanvas.width = targetWidth;
-      destCanvas.height = targetHeight;
-      const destCtx = destCanvas.getContext('2d');
-      if (!destCtx) return resolve(null);
-
-      // Draw background white for JPEG
-      destCtx.fillStyle = '#FFFFFF';
-      destCtx.fillRect(0, 0, targetWidth, targetHeight);
-
-      // Draw original onto destination (scales automatically)
-      destCtx.drawImage(srcCanvas, 0, 0, width, height, 0, 0, targetWidth, targetHeight);
-
-      destCanvas.toBlob(
-        (blob) => resolve(blob ? { blob, width: targetWidth, height: targetHeight } : null),
-        'image/jpeg',
-        quality / 100
-      );
-    } catch (e) {
-      console.error('Error compressing RGB pixels:', e);
-      resolve(null);
-    }
-  });
-}
-
-function formatBytes(bytes: number): string {
-  if (bytes === 0) return '0 Bytes';
-  const k = 1024;
-  const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
-
-/**
- * Optimizes PDF file
- */
-export const optimizePDF = async (
-  file: File, 
-  quality: number,
-  _skipPng: boolean,
-  onProgress: (progress: number) => void
-): Promise<OptimizationResult> => {
-  const originalSize = file.size;
-  const logs: string[] = [`Starting PDF optimization: ${file.name}`];
-  const targetSize = Math.round(originalSize * (quality / 100));
-  const tolerance = Math.max(4096, Math.round(targetSize * 0.03));
-  let currentBytes = new Uint8Array(await file.arrayBuffer());
-  let previousSize = currentBytes.length;
-  let optimizedAnyImage = false;
-
-  onProgress(8);
-
-  // A PDF's exact size cannot be inferred from JPEG quality. Each pass measures the
-  // actual document and tightens the image byte budget until the target is reached.
-  for (let pass = 0; pass < 3 && currentBytes.length > targetSize + tolerance; pass++) {
-    const pdfDoc = await PDFDocument.load(currentBytes, { ignoreEncryption: true });
-    const imageRefs: PDFRef[] = [];
-    let totalImageBytes = 0;
-
-    pdfDoc.context.enumerateIndirectObjects().forEach(([ref, object]) => {
-      if (!(object instanceof PDFRawStream)) return;
-      if (object.dict.get(PDFName.of('Subtype')) !== PDFName.of('Image')) return;
-
-      const filter = object.dict.get(PDFName.of('Filter'));
-      const hasFilterArray = Boolean(filter && typeof (filter as any).asArray === 'function');
-      const supportedFilter = !filter || (!hasFilterArray && (hasDCTFilter(filter) || hasFlateFilter(filter)));
-      const hasTransparency = object.dict.has(PDFName.of('SMask')) || object.dict.has(PDFName.of('Mask'));
-      const isImageMask = object.dict.has(PDFName.of('ImageMask'));
-      if (!supportedFilter || hasTransparency || isImageMask) return;
-
-      const width = getNumericValue(object.dict.get(PDFName.of('Width')));
-      const height = getNumericValue(object.dict.get(PDFName.of('Height')));
-      if (!width || !height) return;
-
-      imageRefs.push(ref);
-      totalImageBytes += object.getContents().length;
-    });
-
-    logs.push(`Pass ${pass + 1}: ${imageRefs.length} safely optimizable image(s), ${formatBytes(totalImageBytes)} total.`);
-    if (imageRefs.length === 0 || totalImageBytes === 0) {
-      currentBytes = await pdfDoc.save({
-        useObjectStreams: true,
-        addDefaultPage: false,
-        updateFieldAppearances: false,
-      });
-      logs.push(`Structural optimization result: ${formatBytes(currentBytes.length)}.`);
-      break;
-    }
-
-    const bytesToRemove = Math.max(0, currentBytes.length - targetSize);
-    const targetImageRatio = Math.max(0.06, Math.min(0.98, (totalImageBytes - bytesToRemove) / totalImageBytes));
-    const passQuality = Math.max(12, Math.round(quality * Math.pow(0.72, pass)));
-    const baseMaxDimension = Math.max(480, Math.round(getMaxDimension(quality) * Math.pow(0.78, pass)));
-
-    let processedImages = 0;
-    for (const ref of imageRefs) {
-      const imageObject = pdfDoc.context.lookup(ref);
-      if (!(imageObject instanceof PDFRawStream)) continue;
-
+    let changed = 0;
+    for (let i = 0; i < assets.length; i++) {
+      const asset = assets[i];
+      cancelled(options.signal);
+      report({ percent: 8 + Math.round((pass + i / Math.max(1, assets.length)) / steps.length * 85), message: `${pass + 1}차 조절 · 이미지 ${i + 1}/${assets.length}` });
+      if (failed.has(asset.key)) continue;
       try {
-        const width = getNumericValue(imageObject.dict.get(PDFName.of('Width')))!;
-        const height = getNumericValue(imageObject.dict.get(PDFName.of('Height')))!;
-        const filterObj = imageObject.dict.get(PDFName.of('Filter'));
-        const isDCT = hasDCTFilter(filterObj);
-        const bytes = imageObject.getContents();
-        const desiredImageSize = Math.max(1024, Math.round(bytes.length * targetImageRatio));
-        let rgbBytes: Uint8Array | null = null;
-
-        if (!isDCT) {
-          const colorSpaceObj = imageObject.dict.get(PDFName.of('ColorSpace'));
-          const colorspaceInfo = resolveColorSpace(colorSpaceObj, pdfDoc.context);
-          const bitsPerComponent = getNumericValue(imageObject.dict.get(PDFName.of('BitsPerComponent'))) || 8;
-          if (![1, 2, 4, 8].includes(bitsPerComponent)) throw new Error(`Unsupported ${bitsPerComponent}-bit image`);
-          if (bitsPerComponent < 8 && !['Gray', 'Indexed'].includes(colorspaceInfo.type)) {
-            throw new Error('Packed RGB/CMYK image is not safely supported');
-          }
-          if (colorspaceInfo.type === 'Indexed' && (!colorspaceInfo.palette || colorspaceInfo.palette.length === 0)) {
-            throw new Error('Indexed image has no readable palette');
-          }
-
-          let params: any = imageObject.dict.get(PDFName.of('DecodeParms'));
-          if (params instanceof PDFRef) params = pdfDoc.context.lookup(params);
-          if (params && typeof params.asArray === 'function') throw new Error('Decode parameter arrays are not supported');
-          const predictor = params instanceof PDFDict
-            ? (getNumericValue(params.get(PDFName.of('Predictor'))) || 1)
-            : 1;
-          if (predictor === 2) throw new Error('TIFF predictor is not safely supported');
-
-          let decodedBytes: Uint8Array;
-          try {
-            decodedBytes = hasFlateFilter(filterObj) ? pako.inflate(bytes) : bytes;
-          } catch (inflateErr: any) {
-            throw new Error(`FlateDecode failed: ${inflateErr.message || inflateErr}`);
-          }
-          const rawBytes = predictor >= 10
-            ? decodePngPredictor(decodedBytes, width, height, bitsPerComponent, colorspaceInfo.components, predictor)
-            : decodedBytes;
-          rgbBytes = convertToRGB(rawBytes, width, height, bitsPerComponent, colorspaceInfo);
-        }
-
-        let selected: EncodedImage | null = null;
-        const attempts = [1, 0.78, 0.58, 0.42];
-        for (const factor of attempts) {
-          const candidateQuality = Math.max(10, Math.round(passQuality * factor));
-          const candidateMaxDimension = Math.max(420, Math.round(baseMaxDimension * Math.sqrt(factor)));
-          const candidate = isDCT
-            ? await compressImage(new Blob([bytes], { type: 'image/jpeg' }), candidateQuality, 'image/jpeg', candidateMaxDimension)
-            : await compressRGBPixels(rgbBytes!, width, height, candidateQuality, logs, candidateMaxDimension);
-          if (!candidate) continue;
-          if (!selected || candidate.blob.size < selected.blob.size) selected = candidate;
-          if (candidate.blob.size <= desiredImageSize) {
-            selected = candidate;
-            break;
-          }
-        }
-
-        if (selected && selected.blob.size < bytes.length) {
-          const compressedBytes = new Uint8Array(await selected.blob.arrayBuffer());
-          const dictMap = new Map<PDFName, any>();
-          imageObject.dict.entries().forEach(([key, val]) => dictMap.set(key, val));
-
-          // JPEG bytes produced by Canvas are always 8-bit DeviceRGB. Keeping the
-          // old dimensions/colorspace is invalid and caused malformed or tinted PDFs.
-          dictMap.set(PDFName.of('Filter'), PDFName.of('DCTDecode'));
-          dictMap.set(PDFName.of('Width'), pdfDoc.context.obj(selected.width));
-          dictMap.set(PDFName.of('Height'), pdfDoc.context.obj(selected.height));
-          dictMap.set(PDFName.of('ColorSpace'), PDFName.of('DeviceRGB'));
-          dictMap.set(PDFName.of('BitsPerComponent'), pdfDoc.context.obj(8));
-          dictMap.delete(PDFName.of('DecodeParms'));
-          dictMap.delete(PDFName.of('Decode'));
-          dictMap.delete(PDFName.of('Length'));
-
-          pdfDoc.context.assign(ref, PDFRawStream.of(
-            PDFDict.fromMapWithContext(dictMap, pdfDoc.context),
-            compressedBytes
-          ));
-          optimizedAnyImage = true;
-          logs.push(`Optimized ${ref.toString()}: ${formatBytes(bytes.length)} -> ${formatBytes(selected.blob.size)}.`);
-        }
-      } catch (error: any) {
-        logs.push(`Skipped ${ref.toString()}: ${error.message || error}`);
-      }
-
-      processedImages++;
-      const passStart = 10 + pass * 27;
-      onProgress(passStart + Math.round((processedImages / imageRefs.length) * 25));
+        const encoded = await encodeImage(new Blob([asset.bytes], { type: asset.mime }), asset.mime, quality, side, options.signal);
+        if (encoded.size < asset.bytes.length) { zip.file(asset.key, encoded, { date: original.files[asset.key].date }); changed++; }
+      } catch (error) { cancelled(options.signal); failed.add(asset.key); logs.push(`원본 유지: ${asset.key} · ${String(error)}`); }
+      await yieldUI();
     }
-
-    const savedBytes = await pdfDoc.save({
-      useObjectStreams: true,
-      addDefaultPage: false,
-      updateFieldAppearances: false,
-    });
-    currentBytes = savedBytes;
-    logs.push(`Pass ${pass + 1} document size: ${formatBytes(currentBytes.length)}.`);
-
-    // Stop when another lossy pass would provide negligible benefit.
-    if (previousSize - currentBytes.length < Math.max(2048, previousSize * 0.005)) break;
-    previousSize = currentBytes.length;
+    const blob = await zip.generateAsync({ type: 'blob', compression: 'DEFLATE', compressionOptions: { level: 9 } }, () => cancelled(options.signal));
+    cancelled(options.signal);
+    logs.push(`${attempts}차: 긴 변 ${side}px 상한, JPEG 품질 ${Math.round(quality * 100)}%, 결과 ${blob.size.toLocaleString()}바이트`);
+    if (blob.size < best.size) { best = blob; bestChanged = changed; }
+    if (best.size <= target) break;
   }
+  report({ percent: 100, message: '처리 완료' });
+  return result(file, best, target, bestChanged, skipped + failed.size, attempts, logs);
+}
 
-  onProgress(96);
-  const useOriginal = currentBytes.length >= originalSize;
-  const resultBytes = useOriginal ? new Uint8Array(await file.arrayBuffer()) : currentBytes;
-  const targetAchieved = resultBytes.length <= targetSize + tolerance;
-  const warning = targetAchieved
-    ? undefined
-    : optimizedAnyImage
-      ? `목표 ${quality}%에 도달하지 못했습니다. 이 PDF는 이미지 외의 텍스트, 글꼴, 벡터 데이터 비중이 커서 원본 대비 ${(resultBytes.length / originalSize * 100).toFixed(1)}%까지 안전하게 줄였습니다.`
-      : '안전하게 재압축할 수 있는 이미지가 없어 목표 용량에 도달하지 못했습니다. 텍스트와 벡터 품질을 유지하는 범위에서는 더 줄일 수 없습니다.';
+const nameOf = (object: unknown) => object instanceof PDFName ? object.decodeText() : '';
+const numberOf = (object: unknown) => object instanceof PDFNumber ? object.asNumber() : 0;
 
-  onProgress(100);
-  const resultBlob = new Blob([resultBytes], { type: 'application/pdf' });
-  return {
-    originalSize,
-    compressedSize: resultBlob.size,
-    fileName: file.name,
-    reductionPercentage: Math.max(0, ((originalSize - resultBlob.size) / originalSize) * 100),
-    blob: resultBlob,
-    optimizationLogs: logs,
-    targetSize,
-    targetAchieved,
-    warning
-  };
-};
+async function pdfAsset(stream: PDFRawStream, doc: PDFDocument, key: string): Promise<ImageAsset> {
+  const dict = stream.dict;
+  const width = numberOf(dict.lookup(PDFName.of('Width'))), height = numberOf(dict.lookup(PDFName.of('Height')));
+  const bits = numberOf(dict.lookup(PDFName.of('BitsPerComponent')));
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width * height > 20_000_000) throw new Error('이미지 크기 제한');
+  if (dict.has(PDFName.of('Decode')) || dict.has(PDFName.of('SMask')) || dict.has(PDFName.of('Mask')) || dict.has(PDFName.of('SMaskInData')) || dict.has(PDFName.of('Alternates')) || dict.lookup(PDFName.of('ImageMask')) === PDFBool.True) throw new Error('투명도·마스크 또는 특수 이미지 보호');
+  const color = nameOf(dict.lookup(PDFName.of('ColorSpace')));
+  if (!['DeviceRGB', 'DeviceGray'].includes(color)) throw new Error('색 공간 원본 유지');
+  let filter = dict.lookup(PDFName.of('Filter'));
+  if (filter instanceof PDFArray) { if (filter.size() !== 1) throw new Error('복합 필터 원본 유지'); filter = filter.lookup(0); }
+  const filterName = nameOf(filter);
+  if (filter && !['FlateDecode', 'DCTDecode'].includes(filterName)) throw new Error('미지원 필터 원본 유지');
+  if (filterName === 'DCTDecode') {
+    if (bits !== 8 || dict.has(PDFName.of('DecodeParms'))) throw new Error('특수 JPEG 원본 유지');
+    return { key, bytes: stream.getContents(), mime: 'image/jpeg' };
+  }
+  const components = color === 'DeviceRGB' ? 3 : 1;
+  let params = dict.lookup(PDFName.of('DecodeParms'));
+  if (params instanceof PDFArray) params = params.lookup(0);
+  if (params && !(params instanceof PDFDict)) throw new Error('DecodeParms 원본 유지');
+  let predictor = 1;
+  if (params instanceof PDFDict) {
+    predictor = numberOf(params.lookup(PDFName.of('Predictor'))) || 1;
+    const columns = numberOf(params.lookup(PDFName.of('Columns'))) || 1;
+    const colors = numberOf(params.lookup(PDFName.of('Colors'))) || 1;
+    const depth = numberOf(params.lookup(PDFName.of('BitsPerComponent'))) || 8;
+    if (predictor !== 1 && (columns !== width || colors !== components || depth !== bits)) throw new Error('Predictor 속성 불일치');
+  }
+  const expected = (Math.ceil(width * bits * components / 8) + (predictor >= 10 ? 1 : 0)) * height;
+  const bytes = filterName === 'FlateDecode' ? inflateBounded(stream.getContents(), expected) : stream.getContents();
+  const pixels = unpackPixels(bytes, width, height, bits, components, predictor);
+  const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height;
+  try {
+    const ctx = canvas.getContext('2d'); if (!ctx) throw new Error('Canvas 미지원');
+    ctx.putImageData(new ImageData(pixels, width, height), 0, 0);
+    const blob = await new Promise<Blob>((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error('이미지 추출 실패')), 'image/png'));
+    return { key, bytes: new Uint8Array(await blob.arrayBuffer()), mime: 'image/png' };
+  } finally { canvas.width = canvas.height = 0; }
+}
+
+export async function optimizePDF(file: File, options: Options, report: Report): Promise<OptimizationResult> {
+  limitFile(file); cancelled(options.signal);
+  const target = Math.max(1, Math.floor(file.size * (1 - options.reduction / 100)));
+  report({ percent: 2, message: 'PDF 이미지와 문서 구조 확인 중' });
+  const originalBytes = await file.arrayBuffer();
+  let original: PDFDocument;
+  try { original = await PDFDocument.load(originalBytes, { updateMetadata: false }); }
+  catch { throw new Error('PDF를 읽지 못했습니다. 암호화·DRM 문서는 지원하지 않습니다.'); }
+  const objects = original.context.enumerateIndirectObjects();
+  if (objects.some(([, object]) => object instanceof PDFDict && (nameOf(object.lookup(PDFName.of('FT'))) === 'Sig' || object.has(PDFName.of('ByteRange'))))) throw new Error('전자서명 PDF는 서명 보존을 위해 처리하지 않습니다.');
+  const protectedRefs = new Set<string>();
+  for (const [, object] of objects) if (object instanceof PDFRawStream) for (const key of ['SMask', 'Mask']) {
+    const ref = object.dict.get(PDFName.of(key)); if (ref instanceof PDFRef) protectedRefs.add(ref.toString());
+  }
+  const streams = objects.filter(([, object]) => object instanceof PDFRawStream && nameOf(object.dict.lookup(PDFName.of('Subtype'))) === 'Image') as [PDFRef, PDFRawStream][];
+  if (streams.length > 500) throw new Error('PDF 이미지가 500개를 넘습니다. 문서를 나눠 처리해 주세요.');
+  const assets: ImageAsset[] = [], logs: string[] = []; let skipped = 0, totalPixels = 0;
+  for (let i = 0; i < streams.length; i++) {
+    cancelled(options.signal);
+    const [ref, stream] = streams[i];
+    report({ percent: 3 + Math.round(i / Math.max(1, streams.length) * 17), message: `PDF 이미지 분석 ${i + 1}/${streams.length}` });
+    try {
+      if (protectedRefs.has(ref.toString())) throw new Error('투명도 마스크 원본 유지');
+      if (options.protectPng && nameOf(stream.dict.lookup(PDFName.of('Filter'))) !== 'DCTDecode') throw new Error('무손실 이미지 보호 설정');
+      totalPixels += numberOf(stream.dict.lookup(PDFName.of('Width'))) * numberOf(stream.dict.lookup(PDFName.of('Height')));
+      if (totalPixels > 80_000_000) throw new Error('문서 전체 이미지 메모리 한도');
+      assets.push(await pdfAsset(stream, original, ref.toString()));
+    } catch (error) { skipped++; logs.push(`이미지 ${ref.toString()} 원본 유지: ${String(error)}`); }
+    await yieldUI();
+  }
+  let best: Blob = file, bestChanged = 0, attempts = 0;
+  const steps = assets.length ? plan(options.minimumSide) : [{ quality: 1, side: 2600 }];
+  for (let pass = 0; pass < steps.length; pass++) {
+    cancelled(options.signal); attempts++;
+    const doc = await PDFDocument.load(originalBytes, { updateMetadata: false });
+    const refs = new Map(doc.context.enumerateIndirectObjects().map(([ref, object]) => [ref.toString(), { ref, object }]));
+    const { quality, side } = steps[pass]; let changed = 0;
+    for (let i = 0; i < assets.length; i++) {
+      cancelled(options.signal);
+      const asset = assets[i], entry = refs.get(asset.key)!;
+      report({ percent: 20 + Math.round((pass + i / Math.max(1, assets.length)) / steps.length * 75), message: `${pass + 1}차 조절 · PDF 이미지 ${i + 1}/${assets.length}` });
+      try {
+        const blob = await encodeImage(new Blob([asset.bytes], { type: asset.mime }), 'image/jpeg', quality, side, options.signal);
+        const old = entry.object as PDFRawStream;
+        if (blob.size >= old.getContents().length) continue;
+        const embedded = await doc.embedJpg(await blob.arrayBuffer());
+        await embedded.embed();
+        const replacement = doc.context.lookup(embedded.ref);
+        if (!(replacement instanceof PDFRawStream)) throw new Error('PDF 이미지 삽입 실패');
+        // Retain only properties that remain meaningful for the new pixels.
+        for (const key of ['Interpolate', 'Intent', 'OC']) {
+          const value = old.dict.get(PDFName.of(key)); if (value) replacement.dict.set(PDFName.of(key), value);
+        }
+        doc.context.assign(entry.ref, replacement);
+        // Avoid retaining a second copy of the same JPEG under its temporary ref.
+        doc.context.delete(embedded.ref);
+        changed++;
+      } catch (error) { cancelled(options.signal); if (pass === 0) logs.push(`이미지 ${asset.key} 교체 생략: ${String(error)}`); }
+      await yieldUI();
+    }
+    const bytes = await doc.save({ useObjectStreams: true, addDefaultPage: false, updateFieldAppearances: false });
+    cancelled(options.signal);
+    const blob = new Blob([bytes], { type: 'application/pdf' });
+    logs.push(`${attempts}차: 긴 변 ${side}px 상한, JPEG 품질 ${Math.round(quality * 100)}%, 결과 ${blob.size.toLocaleString()}바이트`);
+    if (blob.size < best.size) { best = blob; bestChanged = changed; }
+    if (best.size <= target) break;
+  }
+  report({ percent: 100, message: '처리 완료' });
+  return result(file, best, target, bestChanged, skipped, attempts, logs);
+}

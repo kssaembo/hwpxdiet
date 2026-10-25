@@ -1,375 +1,87 @@
+import { useEffect, useRef, useState } from 'react';
+import { ArrowDownToLine, CheckCircle2, FileText, FolderOpen, Gauge, LoaderCircle, ShieldCheck, SlidersHorizontal, X } from 'lucide-react';
+import { optimizePDF, optimizeZipBasedDoc } from './services/optimizerService';
+import type { OptimizationResult, Progress } from './types';
 
-import React, { useEffect, useMemo, useState } from 'react';
-import { 
-  Upload, 
-  Download, 
-  FileWarning, 
-  CheckCircle2, 
-  ArrowRight, 
-  BarChart3, 
-  RotateCcw,
-  FileText,
-  Zap,
-  AlertCircle,
-  ShieldAlert
-} from 'lucide-react';
-import Layout from './components/Layout';
-import { OptimizationResult } from './types';
-import { optimizeZipBasedDoc, optimizePDF } from './services/optimizerService';
+type Kind = 'hwpx' | 'pdf' | 'office';
+const size = (bytes: number) => bytes < 1024 ? `${bytes} B` : bytes < 1024 ** 2 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 ** 2).toFixed(2)} MB`;
+const accepted = { hwpx: '.hwpx', pdf: '.pdf', office: '.pptx,.show' };
+const titles = { hwpx: '한글 HWPX', pdf: 'PDF', office: 'PPTX · SHOW' };
 
-type TabType = 'HWPX' | 'PDF' | 'PPTX_SHOW';
-
-const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<TabType>('HWPX');
-  const [quality, setQuality] = useState(70);
-  const [skipPng, setSkipPng] = useState(true); // Default to true to be safe
+export default function App() {
+  const [kind, setKind] = useState<Kind>('hwpx');
+  const [reduction, setReduction] = useState(50);
+  const [protectPng, setProtectPng] = useState(false);
+  const [minimumSide, setMinimumSide] = useState(1000);
   const [file, setFile] = useState<File | null>(null);
-  const [isProcessing, setIsProcessing] = useState(false);
-  const [progress, setProgress] = useState(0);
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState<Progress>({ percent: 0, message: '' });
   const [result, setResult] = useState<OptimizationResult | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState('');
+  const [download, setDownload] = useState('');
+  const [drag, setDrag] = useState(false);
+  const input = useRef<HTMLInputElement>(null);
+  const controller = useRef<AbortController | null>(null);
 
-  const resultUrl = useMemo(
-    () => result ? URL.createObjectURL(result.blob) : null,
-    [result]
-  );
+  useEffect(() => {
+    if (!result) { setDownload(''); return; }
+    const url = URL.createObjectURL(result.blob); setDownload(url);
+    return () => URL.revokeObjectURL(url);
+  }, [result]);
+  useEffect(() => () => controller.current?.abort(), []);
 
-  useEffect(() => () => {
-    if (resultUrl) URL.revokeObjectURL(resultUrl);
-  }, [resultUrl]);
-
-  const selectFile = (selected: File) => {
-      const fileName = selected.name.toLowerCase();
-      
-      // Legacy format validation
-      if (fileName.endsWith('.hwp')) {
-        setError("HWP 파일은 지원하지 않습니다. 한글 프로그램에서 '다른 이름으로 저장'을 통해 .hwpx 형식으로 변환 후 다시 시도해주세요.");
-        setFile(null);
-        return;
-      }
-      if (fileName.endsWith('.ppt')) {
-        setError("PPT 파일은 지원하지 않습니다. 파워포인트에서 '다른 이름으로 저장'을 통해 .pptx 형식으로 변환 후 다시 시도해주세요.");
-        setFile(null);
-        return;
-      }
-
-      const isExpectedType = activeTab === 'HWPX'
-        ? fileName.endsWith('.hwpx')
-        : activeTab === 'PDF'
-          ? fileName.endsWith('.pdf')
-          : fileName.endsWith('.pptx') || fileName.endsWith('.show');
-      if (!isExpectedType) {
-        setError(`${activeTab === 'PPTX_SHOW' ? 'PPTX 또는 SHOW' : activeTab} 파일을 선택해주세요.`);
-        setFile(null);
-        return;
-      }
-
-      setFile(selected);
-      setResult(null);
-      setError(null);
-      setProgress(0);
+  const select = (selected?: File) => {
+    if (!selected || running) return;
+    const ext = selected.name.split('.').pop()?.toLowerCase();
+    if (ext === 'hwp' || ext === 'ppt') { setError('한글·파워포인트에서 HWPX 또는 PPTX로 저장한 후 선택해 주세요.'); return; }
+    const detected: Kind | undefined = ext === 'hwpx' ? 'hwpx' : ext === 'pdf' ? 'pdf' : ext === 'pptx' || ext === 'show' ? 'office' : undefined;
+    if (!detected || !selected.size) { setError('비어 있지 않은 HWPX, PDF, PPTX, SHOW 파일을 선택해 주세요.'); return; }
+    if (selected.size > 150 * 1024 ** 2) { setError('150MB 이하 파일을 선택해 주세요.'); return; }
+    setKind(detected); setFile(selected); setResult(null); setError(''); setProgress({ percent: 0, message: '' });
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0];
-    if (selected) selectFile(selected);
-  };
-
-  const runOptimization = async () => {
-    if (!file) return;
-
-    // Large file confirmation
-    if (file.size > 100 * 1024 * 1024) {
-      const proceed = window.confirm(
-        "100MB 이상의 대용량 파일은 변환 과정에서 시간이 오래 걸리거나 브라우저가 일시적으로 멈추는 등의 문제가 발생할 수 있습니다.\n\n계속 진행하시겠습니까?"
-      );
-      if (!proceed) return;
-    }
-
-    setIsProcessing(true);
-    setProgress(0);
-    setError(null);
+  const run = async () => {
+    if (!file || running) return;
+    const active = new AbortController(); controller.current = active;
+    setRunning(true); setError(''); setResult(null);
     try {
-      let res: OptimizationResult;
-      if (activeTab === 'HWPX' || activeTab === 'PPTX_SHOW') {
-        res = await optimizeZipBasedDoc(file, quality, skipPng, (p) => setProgress(p));
-      } else {
-        res = await optimizePDF(file, quality, skipPng, (p) => setProgress(p));
-      }
-      setResult(res);
-    } catch (err: any) {
-      console.error(err);
-      setError(`오류 발생: ${err.message || '알 수 없는 오류가 발생했습니다.'}\n파일이 손상되었거나 브라우저 메모리가 부족할 수 있습니다.\n특히 DRM(문서보안)이 적용된 파일은 최적화가 불가능합니다.`);
-    } finally {
-      setIsProcessing(false);
-    }
+      const options = { reduction, protectPng, minimumSide, signal: active.signal };
+      const output = await (kind === 'pdf' ? optimizePDF : optimizeZipBasedDoc)(file, options, value => { if (!active.signal.aborted) setProgress(value); });
+      if (!active.signal.aborted) setResult(output);
+    } catch (err) {
+      setError(active.signal.aborted ? '작업을 취소했습니다. 원본은 변경되지 않았습니다.' : err instanceof Error ? err.message : '처리 중 오류가 발생했습니다.');
+    } finally { setRunning(false); controller.current = null; }
   };
 
-  const reset = () => {
-    setFile(null);
-    setResult(null);
-    setError(null);
-    setProgress(0);
-  };
-
-  const formatSize = (bytes: number) => {
-    if (bytes === 0) return '0 Bytes';
-    const k = 1024;
-    const sizes = ['Bytes', 'KB', 'MB', 'GB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
-
-  const getAcceptExtensions = () => {
-    switch(activeTab) {
-      case 'HWPX': return '.hwpx';
-      case 'PDF': return '.pdf';
-      case 'PPTX_SHOW': return '.pptx,.show';
-      default: return '';
-    }
-  };
-
-  return (
-    <Layout 
-      quality={quality} 
-      setQuality={setQuality} 
-      skipPng={skipPng} 
-      setSkipPng={setSkipPng} 
-      activeTab={activeTab}
-    >
-      <div className="flex flex-col gap-8">
-        {/* Tab Selection */}
-        <div className="flex p-1 bg-slate-200 rounded-xl w-fit flex-wrap gap-1">
-          <button
-            onClick={() => { setActiveTab('HWPX'); reset(); }}
-            className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-all ${
-              activeTab === 'HWPX' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            HWPX 압축
-          </button>
-          <button
-            onClick={() => { setActiveTab('PDF'); reset(); }}
-            className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-all ${
-              activeTab === 'PDF' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            PDF 압축
-          </button>
-          <button
-            onClick={() => { setActiveTab('PPTX_SHOW'); reset(); }}
-            className={`px-6 py-2.5 rounded-lg text-sm font-semibold transition-all ${
-              activeTab === 'PPTX_SHOW' ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-600 hover:text-slate-900'
-            }`}
-          >
-            PPTX / SHOW 압축
-          </button>
+  const clear = () => { if (!running) { setFile(null); setResult(null); setError(''); } };
+  const target = file ? Math.floor(file.size * (1 - reduction / 100)) : 0;
+  return <div className="shell">
+    <header><div className="brand"><span className="brand-icon"><FileText size={27} /></span><div><h1>파일 다이어트</h1><small>FILE DIET</small></div></div><span className="badge">v2.0 · 목표 용량 압축</span></header>
+    <main><section className="intro"><span className="pill"><ShieldCheck size={14} /> 파일 전송 없이, 내 기기에서</span><h2>무거운 문서를<br /><em>가볍게 줄이세요.</em></h2><p>목표 절감률을 정하면, 이미지 품질과 크기를 조절하며<br className="desktop" /> 실제 파일 크기를 확인해 목표에 맞춰 압축합니다.</p></section>
+    <div className="tabs" role="tablist" aria-label="문서 형식">{(Object.keys(titles) as Kind[]).map(key => <button role="tab" key={key} aria-selected={kind === key} disabled={running} className={kind === key ? 'active' : ''} onClick={() => { setKind(key); clear(); }}>{titles[key]}</button>)}</div>
+    <div className="workspace">
+      <section className="card file-card"><div className="card-heading"><span className="number">01</span><h3>파일 선택</h3><span className="hint">최대 150MB</span></div>
+        <div className={`dropzone ${drag ? 'dragging' : ''}`} onDragOver={event => { event.preventDefault(); if (!running) setDrag(true); }} onDragLeave={() => setDrag(false)} onDrop={event => { event.preventDefault(); setDrag(false); select(event.dataTransfer.files[0]); }}>
+          <button disabled={running} onClick={() => input.current?.click()}><span className="folder-icon"><FolderOpen size={37} /></span><strong>{file ? file.name : '문서 파일 선택하기'}</strong><span>{file ? `${size(file.size)} · 다른 파일로 변경` : '여기에 파일을 끌어 놓아도 돼요'}</span></button>
+          <input ref={input} type="file" accept={accepted[kind]} hidden aria-label="문서 파일 선택" disabled={running} onChange={event => { select(event.target.files?.[0]); event.target.value = ''; }} />
         </div>
-
-        {!result ? (
-          <div
-            className="bg-white border-2 border-dashed border-slate-200 rounded-3xl p-12 flex flex-col items-center text-center"
-            onDragOver={(event) => event.preventDefault()}
-            onDrop={(event) => {
-              event.preventDefault();
-              const droppedFile = event.dataTransfer.files?.[0];
-              if (droppedFile) selectFile(droppedFile);
-            }}
-          >
-            <div className="w-20 h-20 bg-blue-50 rounded-full flex items-center justify-center mb-6">
-              <Upload className="text-blue-600 w-10 h-10" />
-            </div>
-            <h2 className="text-2xl font-bold text-slate-900 mb-2">파일을 업로드하세요</h2>
-            <div className="mb-8 flex flex-col items-center gap-2">
-              <p className="text-slate-500 max-w-sm">
-                최적화할 {activeTab === 'PPTX_SHOW' ? 'PPTX 또는 SHOW' : activeTab} 파일을 선택하거나 이 영역으로 드래그 앤 드롭 하세요.
-              </p>
-              <div className="bg-amber-50 border border-amber-100 px-4 py-2 rounded-lg flex items-center gap-2 text-amber-700 text-xs mt-2">
-                <ShieldAlert size={14} />
-                <span>DRM(문서보안) 적용 파일은 지원하지 않습니다.</span>
-              </div>
-              {activeTab === 'HWPX' && (
-                <p className="text-blue-600 text-sm font-medium mt-1">
-                  * hwp 파일은 hwpx 파일로 변환 후 업로드 해주세요.
-                </p>
-              )}
-              {activeTab === 'PPTX_SHOW' && (
-                <div className="flex flex-col gap-1 items-center">
-                  <p className="text-blue-600 text-sm font-medium mt-1">
-                    * ppt 파일은 pptx 파일로 변환 후 업로드 해주세요.
-                  </p>
-                  <p className="text-slate-400 text-xs flex items-center gap-1 mt-1">
-                    <AlertCircle size={12} /> 100MB 이상의 대용량 파일은 처리 중 브라우저가 일시적으로 느려질 수 있습니다.
-                  </p>
-                </div>
-              )}
-            </div>
-            
-            <input
-              type="file"
-              id="fileInput"
-              accept={getAcceptExtensions()}
-              className="hidden"
-              onChange={handleFileChange}
-            />
-            
-            <div className="flex flex-col gap-4 w-full max-w-sm">
-              <label
-                htmlFor="fileInput"
-                className="cursor-pointer bg-white border border-slate-300 hover:border-blue-400 text-slate-700 font-semibold py-3 px-6 rounded-xl shadow-sm transition-all flex items-center justify-center gap-2"
-              >
-                <FileText size={18} /> {file ? file.name : '파일 선택하기'}
-              </label>
-
-              {file && !isProcessing && (
-                <button
-                  onClick={runOptimization}
-                  className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-6 rounded-xl shadow-lg shadow-blue-200 transition-all flex items-center justify-center gap-2"
-                >
-                  <Zap size={18} /> 다이어트 시작하기
-                </button>
-              )}
-
-              {isProcessing && (
-                <div className="w-full mt-4">
-                  <div className="flex justify-between items-center mb-2">
-                    <span className="text-sm font-bold text-blue-600">진행률</span>
-                    <span className="text-sm font-bold text-blue-600">{progress}%</span>
-                  </div>
-                  <div className="w-full bg-slate-100 rounded-full h-4 overflow-hidden">
-                    <div 
-                      className="bg-blue-600 h-full transition-all duration-300 ease-out"
-                      style={{ width: `${progress}%` }}
-                    ></div>
-                  </div>
-                  <p className="text-xs text-slate-400 mt-2 text-center">
-                    {file && file.size > 100 * 1024 * 1024 
-                      ? "대용량 파일을 처리 중입니다. 브라우저 창을 닫지 마세요." 
-                      : "문서 용량을 줄이는 중입니다. 잠시만 기다려주세요."}
-                  </p>
-                </div>
-              )}
-            </div>
-
-            {error && (
-              <div className="mt-8 p-4 bg-red-50 border border-red-100 rounded-xl flex items-start gap-3 text-left w-full">
-                <FileWarning className="text-red-500 shrink-0 mt-0.5" />
-                <div className="flex flex-col gap-1">
-                  <span className="text-sm font-bold text-red-900 uppercase">에러 상세</span>
-                  <p className="text-sm text-red-700 whitespace-pre-line">{error}</p>
-                </div>
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
-            <div className="bg-white rounded-3xl border border-slate-200 overflow-hidden shadow-xl shadow-slate-200/50">
-              <div className="p-8 border-b border-slate-100 bg-slate-50/50 flex flex-col md:flex-row md:items-center justify-between gap-6">
-                <div className="flex items-center gap-4">
-                  <div className="bg-green-100 p-3 rounded-2xl">
-                    <CheckCircle2 className="text-green-600 w-8 h-8" />
-                  </div>
-                  <div>
-                    <h3 className="text-xl font-bold text-slate-900">최적화 완료!</h3>
-                    <p className="text-sm text-slate-500">
-                      {result.targetAchieved === false
-                        ? '문서 구조상 가능한 범위까지 최적화했습니다.'
-                        : result.targetAchieved === true
-                          ? '설정한 목표에 맞춰 파일을 최적화했습니다.'
-                          : '파일의 이미지와 패키지 구조를 최적화했습니다.'}
-                    </p>
-                  </div>
-                </div>
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={reset}
-                    className="flex items-center gap-2 px-4 py-2 rounded-lg border border-slate-200 text-slate-600 font-medium hover:bg-slate-100 transition-colors"
-                  >
-                    <RotateCcw size={16} /> 다시하기
-                  </button>
-                  <a
-                    href={resultUrl || undefined}
-                    download={`optimized_${result.fileName}`}
-                    className="flex items-center gap-2 px-6 py-2 rounded-lg bg-blue-600 text-white font-bold hover:bg-blue-700 transition-all shadow-lg shadow-blue-100"
-                  >
-                    <Download size={18} /> 다운로드
-                  </a>
-                </div>
-              </div>
-
-              <div className="p-8">
-                {result.warning && (
-                  <div className="mb-6 p-4 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-800 flex items-start gap-2">
-                    <AlertCircle size={18} className="shrink-0 mt-0.5" />
-                    <span>{result.warning}</span>
-                  </div>
-                )}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-                  <div className="p-6 rounded-2xl bg-slate-50 border border-slate-100">
-                    <span className="text-xs font-semibold text-slate-400 uppercase">원본 용량</span>
-                    <p className="text-2xl font-bold text-slate-900 mt-1">{formatSize(result.originalSize)}</p>
-                  </div>
-                  <div className="p-6 rounded-2xl bg-blue-50 border border-blue-100">
-                    <span className="text-xs font-semibold text-blue-400 uppercase">압축 후 용량</span>
-                    <p className="text-2xl font-bold text-blue-600 mt-1">{formatSize(result.compressedSize)}</p>
-                  </div>
-                  <div className="p-6 rounded-2xl bg-green-50 border border-green-100">
-                    <span className="text-xs font-semibold text-green-500 uppercase">절감률</span>
-                    <div className="flex items-center gap-2 mt-1">
-                      <p className="text-2xl font-bold text-green-600">{result.reductionPercentage.toFixed(1)}%</p>
-                      <BarChart3 className="text-green-500" size={20} />
-                    </div>
-                  </div>
-                </div>
-
-                <div className="flex items-center gap-4 bg-slate-100 p-1 rounded-2xl">
-                  <div className="flex-1 bg-white p-4 rounded-xl flex items-center justify-between">
-                    <span className="text-sm font-medium text-slate-500">Original</span>
-                    <div className="h-4 flex-1 mx-4 bg-slate-100 rounded-full overflow-hidden">
-                      <div className="h-full bg-slate-300 w-full"></div>
-                    </div>
-                    <span className="text-xs font-bold text-slate-400">100%</span>
-                  </div>
-                  <ArrowRight className="text-slate-300" />
-                  <div className="flex-1 bg-white p-4 rounded-xl flex items-center justify-between">
-                    <span className="text-sm font-medium text-slate-500">Diet</span>
-                    <div className="h-4 flex-1 mx-4 bg-slate-100 rounded-full overflow-hidden">
-                      <div 
-                        className="h-full bg-blue-600 transition-all duration-1000 ease-out" 
-                        style={{ width: `${Math.max(5, 100 - result.reductionPercentage)}%` }}
-                      ></div>
-                    </div>
-                    <span className="text-xs font-bold text-blue-600">{Math.round(100 - result.reductionPercentage)}%</span>
-                  </div>
-                </div>
-              </div>
-            </div>
-          </div>
-        )}
-
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-6 mt-12">
-          <div className="bg-white p-6 rounded-2xl border border-slate-200">
-            <h4 className="font-bold text-slate-900 mb-2 flex items-center gap-2">
-              <span className="w-1.5 h-6 bg-blue-600 rounded-full inline-block"></span>
-              어떻게 압축되나요?
-            </h4>
-            <p className="text-sm text-slate-600 leading-relaxed">
-              HWPX, PPTX, SHOW 파일은 내부의 이미지 자산을 찾아 설정하신 품질로 재인코딩합니다. PDF는 문서 내부의 고해상도 이미지를 추출하여 최적화하고 용량을 줄입니다. 텍스트 레이아웃은 보존됩니다.
-            </p>
-          </div>
-          <div className="bg-white p-6 rounded-2xl border border-slate-200">
-            <h4 className="font-bold text-slate-900 mb-2 flex items-center gap-2">
-              <span className="w-1.5 h-6 bg-green-500 rounded-full inline-block"></span>
-              보안 안내
-            </h4>
-            <p className="text-sm text-slate-600 leading-relaxed">
-              본 서비스는 Client-side 전용 도구입니다. 데이터 전송이 발생하지 않으며, 처리된 파일은 브라우저 탭을 닫는 즉시 메모리에서 소멸됩니다. 기업용 문서 보안 가이드라인을 준수합니다.
-            </p>
-          </div>
-        </div>
-      </div>
-    </Layout>
-  );
-};
-
-export default App;
+        <p className="caption">HWPX · PDF · PPTX · SHOW <span>선택한 파일 형식 자동 인식</span></p>
+        <div className="size-preview"><div><span>원본</span><strong>{file ? size(file.size) : '—'}</strong></div><span className="arrow">→</span><div><span>목표 용량 이하</span><strong className="blue">{file ? size(target) : '—'}</strong></div></div>
+        <button className="run-button" disabled={!file || running} onClick={() => void run()}>{running ? <LoaderCircle className="spin" size={20} /> : <Gauge size={20} />}{running ? '목표에 맞춰 조절 중' : '목표 용량으로 줄이기'}</button>
+        {running && <div className="progress"><div><span role="status">{progress.message}</span><button onClick={() => controller.current?.abort()}><X size={13} /> 취소</button></div><progress max={100} value={progress.percent} aria-label="압축 진행률" /><small>{progress.percent}% · 큰 문서는 시간이 걸릴 수 있어요.</small></div>}
+      </section>
+      <section className="card settings"><div className="card-heading"><span className="number">02</span><h3>압축 목표 설정</h3><SlidersHorizontal size={17} className="hint" /></div>
+        <div className="goal"><span>목표 절감률</span><div><strong>{reduction}</strong><span>% 줄이기</span></div><p>원본의 {100 - reduction}% 크기 이하를 목표로 합니다.</p></div>
+        <label htmlFor="reduction" className="sr-only">목표 절감률</label><input id="reduction" type="range" min={10} max={90} step={5} value={reduction} disabled={running} onChange={event => { setReduction(Number(event.target.value)); setResult(null); }} /><div className="range-labels"><span>10% 절감</span><span>90% 절감</span></div>
+        <div className="presets">{[30, 50, 70, 90].map(value => <button key={value} disabled={running} className={value === reduction ? 'active' : ''} onClick={() => { setReduction(value); setResult(null); }}>{value}%</button>)}</div>
+        <div className="control"><label htmlFor="quality">화질 하한</label><select id="quality" disabled={running} value={minimumSide} onChange={event => { setMinimumSide(Number(event.target.value)); setResult(null); }}><option value={1600}>선명도 우선 · 긴 변 1600px 하한</option><option value={1000}>균형 · 긴 변 1000px 하한</option><option value={500}>강한 압축 · 긴 변 500px 하한</option></select><p>작은 글자가 이미지에 들어 있다면 선명도 우선을 선택하세요. 원본보다 확대하지 않습니다.</p></div>
+        <label className="toggle"><input type="checkbox" checked={protectPng} disabled={running} onChange={event => { setProtectPng(event.target.checked); setResult(null); }} /><span><strong>{kind === 'pdf' ? 'PDF 무손실 이미지 원본 유지' : 'PNG 이미지 원본 유지'}</strong><small>켜면 절감 가능한 이미지가 줄어듭니다.</small></span></label>
+        <p className="protection"><ShieldCheck size={15} /> PNG 투명도는 옵션을 꺼도 유지합니다.<br />PDF의 투명 이미지·특수 인코딩은 원본을 보호합니다.</p>
+      </section>
+    </div>
+    {error && <div className="error" role="alert">{error}</div>}
+    {result && <section className={`result card ${result.achieved ? 'success' : ''}`} aria-label="압축 결과"><div className="result-heading"><CheckCircle2 size={25} /><div><h3>{result.achieved ? '목표 용량에 도달했어요!' : result.reductionPercentage > 0 ? '가능한 범위까지 줄였어요' : '이 설정에서는 더 줄이기 어려워요'}</h3><p>{result.achieved ? `${result.attempts}회 조절 후 목표를 달성했습니다.` : '이미지 외 데이터·보호된 이미지·화질 하한 때문에 목표에 도달하지 못했습니다.'}</p></div></div><div className="result-grid"><div><span>원본</span><strong>{size(result.originalSize)}</strong></div><div><span>목표</span><strong>{size(result.targetSize)} 이하</strong></div><div><span>실제 결과</span><strong>{size(result.compressedSize)}</strong></div><div><span>실제 절감률</span><strong className="blue">{result.reductionPercentage.toFixed(1)}%</strong></div></div><div className="result-actions"><span>변경 이미지 {result.changedImages}개 · 보호/미지원 {result.skippedImages}개</span><a className="download" href={download} download={`${result.reductionPercentage > 0 ? 'optimized_' : 'original_'}${result.fileName}`}><ArrowDownToLine size={17} />{result.reductionPercentage > 0 ? '줄인 파일 다운로드' : '원본 다운로드'}</a></div>{!result.achieved && minimumSide > 500 && <p className="advice">더 줄이려면 ‘강한 압축’을 선택해 다시 시도할 수 있습니다. 이미지 속 작은 글자의 선명도는 낮아질 수 있어요.</p>}<details><summary>처리 기록 보기</summary><ul>{result.logs.map((log, i) => <li key={i}>{log}</li>)}</ul></details></section>}
+    <aside className="notice"><ShieldCheck size={19} /><p><strong>퍼센트는 목표이며, 달성을 보장하지는 않습니다.</strong> 사진이 많은 문서는 크게 줄일 수 있지만, 텍스트 중심이거나 이미 압축된 문서는 한계가 있어요. 문서의 텍스트·레이아웃 구조는 유지하고 이미지를 조절합니다. 결과는 원본보다 커지지 않으며, 원본 파일은 변경되지 않습니다.</p></aside>
+    <footer><span>ⓒ {new Date().getFullYear()}. Kwon’s class.</span><span>HWP·PPT는 HWPX·PPTX로 저장 후 이용 · 암호화·전자서명 문서 제외</span></footer></main>
+  </div>;
+}
