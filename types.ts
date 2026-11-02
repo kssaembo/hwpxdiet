@@ -5,3 +5,4 @@ export interface OptimizationResult {
   targetSize: number; achieved: boolean; reductionPercentage: number;
   changedImages: number; skippedImages: number; attempts: number; logs: string[];
 }
+

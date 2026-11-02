@@ -35,3 +35,4 @@ export function identifyImage(bytes: Uint8Array): 'image/png' | 'image/jpeg' | n
   if (bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return 'image/jpeg';
   return null;
 }
+

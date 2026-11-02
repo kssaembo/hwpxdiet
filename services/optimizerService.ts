@@ -194,3 +194,4 @@ export async function optimizePDF(file: File, options: Options, report: Report):
   report({ percent: 100, message: '처리 완료' });
   return result(file, best, target, bestChanged, skipped, attempts, logs);
 }
+
